@@ -118,3 +118,4 @@ mod database;
 mod params;
 mod row;
 mod transaction;
+mod service;

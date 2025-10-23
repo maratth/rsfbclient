@@ -148,6 +148,42 @@ pub trait FirebirdClientDbEvents: FirebirdClientDbOps {
     ) -> Result<(), FbError>;
 }
 
+pub trait FirebirdSvcClient
+where
+    Self: FirebirdClientSvcOps,
+    Self: FirebirdClientSvcBackupRestoreOps<SvcHandle = <Self as FirebirdClientSvcOps>::SvcHandle>,
+{
+}
+
+impl<Hdl, A: FirebirdClientSvcOps<SvcHandle = Hdl> + FirebirdClientSvcBackupRestoreOps<SvcHandle = Hdl>>
+FirebirdSvcClient for A
+where
+    Hdl: Send,
+{
+}
+
+/// Responsible for service administration and attachment/detachment
+pub trait FirebirdClientSvcOps {
+    /// A service handle
+    type SvcHandle: Send;
+
+    /// Configuration details for attaching to the service.
+    /// A user of an implementation of this trait can configure attachment details
+    /// (service name, user name, etcetera) and then pass this configuration to the implementation
+    /// via this type when a new attachment is requested
+    type AttachmentConfig: Send + Clone;
+
+    /// Create a new attachment to a service with the provided configuration
+    /// Returns a service handle on success
+    fn attach_service(
+        &mut self,
+        config: &Self::AttachmentConfig,
+    ) -> Result<Self::SvcHandle, FbError>;
+
+    /// Disconnect from the service
+    fn detach_service(&mut self, svc_handle: &mut Self::SvcHandle) -> Result<(), FbError>;
+}
+
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
 #[repr(u8)]
 /// Firebird sql dialect

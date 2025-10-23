@@ -106,9 +106,14 @@ pub enum WireOp {
     SqlResponse = 78,
     /// Drop database request
     DropDatabase = 81,
+
+    /// Attach service
     ServiceAttach = 82,
+    /// Detach service
     ServiceDetach = 83,
+    /// Query info service
     ServiceInfo = 84,
+    /// Start service
     ServiceStart = 85,
     /// Rollback transaction, allowing to reuse it
     RollbackRetaining = 86,

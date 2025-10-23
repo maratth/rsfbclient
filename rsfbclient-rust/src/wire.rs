@@ -4,7 +4,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use std::{convert::TryFrom, str};
-
+use std::str::Bytes;
 use crate::{
     client::{BlobId, FirebirdWireConnection},
     consts::{gds_to_msg, AuthPluginType, Cnct, ProtocolVersion, WireOp},
@@ -12,7 +12,7 @@ use crate::{
     util::*,
     xsqlda::{XSqlVar, XSQLDA_DESCRIBE_VARS},
 };
-use rsfbclient_core::{ibase, Charset, Column, Dialect, FbError, FreeStmtOp, SqlType, TrOp};
+use rsfbclient_core::{ibase, BackupConfiguration, BackupFile, Charset, Column, Dialect, FbError, FreeStmtOp, SqlType, TrOp};
 
 /// Buffer length to use in the connection
 pub const BUFFER_LENGTH: u32 = 1024;
@@ -495,6 +495,147 @@ pub fn close_blob(blob_handle: u32) -> Bytes {
     req.put_u32(blob_handle);
 
     req.freeze()
+}
+
+/// Service attach request
+pub fn service_attach(
+    svc_name: &str,
+    user: &str,
+    pass: &str,
+    protocol: ProtocolVersion,
+    role_name: Option<&str>,
+) -> Bytes {
+    let spb = build_spb(
+        user,
+        pass,
+        protocol,
+        role_name,
+    );
+
+    let mut attach = BytesMut::with_capacity(16 + svc_name.len() + spb.len());
+
+    attach.put_u32(WireOp::ServiceAttach as u32);
+    attach.put_u32(0); // Service Object ID
+
+    attach.put_wire_bytes(svc_name.as_bytes());
+
+    attach.put_wire_bytes(&spb);
+
+    attach.freeze()
+}
+
+/// Spb builder
+fn build_spb(
+    user: &str,
+    pass: &str,
+    protocol: ProtocolVersion,
+    role_name: Option<&str>,
+) -> Bytes {
+    let mut spb = BytesMut::with_capacity(64);
+
+    // Version
+    spb.put_slice(&[ibase::isc_spb_version as u8, ibase::isc_spb_current_version as u8]);
+
+    spb.put_slice(&[ibase::isc_spb_user_name as u8, user.len() as u8]);
+    spb.put_slice(user.as_bytes());
+
+    if let Some(role) = role_name {
+        spb.extend(&[ibase::isc_spb_sql_role_name as u8, role.len() as u8]); // TODO Role really ?
+        spb.extend(role.bytes());
+    }
+
+    match protocol {
+        // Plaintext password
+        ProtocolVersion::V10 => {
+            spb.put_slice(&[ibase::isc_spb_password as u8, pass.len() as u8]);
+            spb.put_slice(pass.as_bytes());
+        }
+
+        // Hashed password
+        ProtocolVersion::V11 | ProtocolVersion::V12 => {
+            #[allow(deprecated)]
+            let enc_pass = pwhash::unix_crypt::hash_with("9z", pass).unwrap();
+            let enc_pass = &enc_pass[2..];
+
+            spb.put_slice(&[ibase::isc_spb_password_enc as u8, enc_pass.len() as u8]);
+            spb.put_slice(enc_pass.as_bytes());
+        }
+
+        // Password already verified
+        ProtocolVersion::V13 => {}
+    }
+
+    spb.freeze()
+}
+
+/// Detach from the service request
+pub fn service_detach(svc_handle: u32) -> Bytes {
+    let mut req = BytesMut::with_capacity(8);
+
+    req.put_u32(WireOp::ServiceDetach as u32);
+    req.put_u32(svc_handle);
+
+    req.freeze()
+}
+
+/// Start service action
+pub fn start_service(svc_handle: u32, spb: &Bytes) -> Bytes {
+    let mut req = BytesMut::with_capacity(16 + spb.len());
+
+    req.put_u32(WireOp::ServiceStart as u32);
+    req.put_u32(svc_handle);
+    req.put_u32(0);
+    req.put_wire_bytes(&spb);
+
+    req.freeze()
+}
+
+/// Query service
+pub fn query_service(svc_handle: u32, spb: &Bytes) -> Bytes {
+    let mut req = BytesMut::with_capacity(24 + spb.len());
+
+    req.put_u32(WireOp::ServiceInfo as u32);
+    req.put_u32(svc_handle);
+    req.put_u32(0);
+    req.put_u32(1);
+    req.put_u8(ibase::isc_spb_current_version as u8);
+    req.put_wire_bytes(&spb);
+    req.put_u32(BUFFER_LENGTH);
+
+    req.freeze()
+}
+
+pub fn build_backup(db_name: &str, backup_files: Vec<BackupFile>, config: BackupConfiguration) -> Bytes {
+    let mut spb = BytesMut::with_capacity(64);
+
+    spb.put_u8(ibase::isc_action_svc_backup as u8);
+
+    spb.put_u8(ibase::isc_spb_dbname as u8);
+    spb.put_u16_le(db_name.as_bytes().len() as u16);
+    spb.put_slice(db_name.as_bytes());
+
+    for backup_file in backup_files {
+        let bytes = backup_file.path.as_bytes();
+
+        spb.put_u8(ibase::isc_spb_bkp_file as u8);
+        spb.put_u16_le(bytes.len() as u16);
+        spb.put_slice(bytes);
+
+        // TODO LENGTH
+    }
+
+    if let Some(factor) = config.factor {
+        spb.put_u8(ibase::isc_spb_bkp_factor as u8);
+        spb.put_u32(factor);
+    }
+
+    // Options
+
+    if config.verbose {
+        spb.put_u8(ibase::isc_spb_verbose as u8);
+    }
+
+    spb
 }
 
 #[derive(Debug)]
@@ -1037,4 +1178,29 @@ pub fn parse_info_sql_affected_rows(data: &mut Bytes) -> Result<usize, FbError> 
     }
 
     Ok(affected_rows)
+}
+
+pub fn parse_service_query(data: &mut Bytes) -> Result<String, FbError> {
+    let mut str: String = "".to_string();
+
+    loop {
+        match data.get_u8()? as u32 {
+            ibase::isc_info_svc_to_eof => {
+                let len = data.get_u16_le()? as usize;
+
+                let mut buff = vec![0; len];
+                data.copy_to_slice(&mut buff)?;
+
+                str = String::from_utf8(buff).unwrap_or_default();
+            }
+
+            ibase::isc_info_end => {
+                break;
+            }
+
+            _ => return Err(FbError::from("Invalid service query response")),
+        }
+    }
+
+    Ok(str)
 }

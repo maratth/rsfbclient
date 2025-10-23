@@ -12,8 +12,10 @@ use rsfbclient_core::*;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::{convert::TryFrom, io::Cursor, ptr, str};
+use std::ptr::null;
 
 type NativeDbHandle = ibase::isc_db_handle;
+type NativeSvcHandle = ibase::isc_svc_handle;
 type NativeTrHandle = ibase::isc_tr_handle;
 type NativeStmtHandle = ibase::isc_stmt_handle;
 
@@ -672,6 +674,179 @@ impl<T: LinkageMarker> FirebirdClientDbEvents for NativeFbClient<T> {
     }
 }
 
+impl<T: LinkageMarker> FirebirdClientSvcOps for NativeFbClient<T> {
+    type SvcHandle = NativeSvcHandle;
+    type AttachmentConfig = NativeFbAttachmentConfig;
+
+    fn attach_service(
+        &mut self,
+        config: &Self::AttachmentConfig
+    ) -> Result<Self::SvcHandle, FbError> {
+        let (mut spb, svc_conn_string) = self.build_spb(config);
+        let mut handle = 0;
+
+        unsafe {
+            if self.ibase.isc_service_attach()(
+                &mut self.status[0],
+                svc_conn_string.len() as u16,
+                svc_conn_string.as_ptr() as *const _,
+                &mut handle,
+                spb.len() as u16,
+                spb.as_ptr() as *const _,
+            ) != 0
+            {
+                return Err(self.status.as_error(&self.ibase));
+            }
+        }
+
+        // Assert that the handle is valid
+        debug_assert_ne!(handle, 0);
+
+        Ok(handle)
+    }
+
+    fn detach_service(&mut self, svc_handle: &mut NativeSvcHandle) -> Result<(), FbError> {
+        unsafe {
+            // Close the connection, if the handle is valid
+            if *svc_handle != 0
+                && self.ibase.isc_service_detach()(&mut self.status[0], svc_handle) != 0
+            {
+                return Err(self.status.as_error(&self.ibase));
+            }
+        }
+        Ok(())
+    }
+
+    fn start_service(&mut self, svc_handle: &mut Self::SvcHandle, spb: Vec<u8>) -> Result<(), FbError> {
+        unsafe {
+            if self.ibase.isc_service_start()(
+                &mut self.status[0],
+                svc_handle,
+                *ptr::null(),
+                spb.len() as u16,
+                spb.as_ptr() as *const _,
+            ) != 0
+            {
+                return Err(self.status.as_error(&self.ibase));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn query_service(&mut self, svc_handle: &mut Self::SvcHandle, sql: &str) -> Result<(), FbError> {
+        unsafe {
+            if self.ibase.isc_service_query()(
+                &mut self.status[0],
+                svc_handle,
+                *ptr::null(),
+                0, // service parameter buffer bytes len
+                0, // data
+                0, // service request buffer bytes len
+                0, // data
+                0, // buffer length
+                0, // response buffer
+            ) != 0
+            {
+                return Err(self.status.as_error(&self.ibase));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<T: LinkageMarker> FirebirdClientSvcBackupRestoreOps for NativeFbClient<T> {
+    type SvcHandle = NativeSvcHandle;
+
+    fn backup(&mut self, svc_handle: &mut Self::SvcHandle, db_name: &str, backup_files: Vec<BackupFile>, config: &BackupConfiguration) -> Result<(), FbError> {
+        let mut spb = Vec::with_capacity(64);
+
+        let mut option_mask: u32 = 0;
+
+        if config.ignore_checksum {
+            option_mask |= ibase::isc_spb_bkp_ignore_checksums;
+        }
+        if config.ignore_limbo {
+            option_mask |= ibase::isc_spb_bkp_ignore_limbo;
+        }
+        if config.metadata_only {
+            option_mask |= ibase::isc_spb_bkp_metadata_only;
+        }
+        if config.no_garbage_collect {
+            option_mask |= ibase::isc_spb_bkp_no_garbage_collect;
+        }
+        if config.old_description {
+            option_mask |= ibase::isc_spb_bkp_old_descriptions;
+        }
+        if config.non_transportable {
+            option_mask |= ibase::isc_spb_bkp_non_transportable;
+        }
+        if config.convert {
+            option_mask |= ibase::isc_spb_bkp_convert;
+        }
+        if config.expand {
+            option_mask |= ibase::isc_spb_bkp_expand;
+        }
+        if config.no_triggers {
+            option_mask |= ibase::isc_spb_bkp_no_triggers;
+        }
+
+        spb.extend(&[ibase::isc_action_svc_backup as u8]);
+
+        spb.extend(&[ibase::isc_spb_dbname as u8]);
+        spb.write_u16::<LittleEndian>(db_name.len() as u16)?;
+        spb.extend(db_name.bytes());
+
+        for backup_file in &backup_files {
+            spb.extend(&[ibase::isc_spb_bkp_file as u8]);
+            spb.write_u16::<LittleEndian>(backup_file.path.len() as u16)?;
+            spb.extend(backup_file.path.bytes());
+
+            // TODO
+            // if let Some(size) = backup_file.size {
+            //     spb.extend(&[ibase::isc_spb_bkp_length as u8]);
+            //
+            //     spb.write_u16::<LittleEndian>(backup_file.path.len() as u16)?;
+            //     spb.extend(size.bytes());
+            // }
+        }
+
+        if let Some(factor) = config.factor {
+            spb.extend(&[ibase::isc_spb_bkp_factor, 4]);
+            spb.write_u32::<LittleEndian>(factor)?;
+        }
+
+        if option_mask > 0 {
+            spb.extend(&[ibase::isc_spb_options as u8, 4]);
+            spb.write_u32::<LittleEndian>(option_mask)?;
+        }
+
+        if config.verbose {
+            spb.extend(&[ibase::isc_spb_version as u8]);
+        }
+
+        unsafe {
+            if self.ibase.isc_service_start()(
+                &mut self.status[0],
+                svc_handle,
+                *ptr::null(),
+                spb.len() as u16,
+                spb.as_ptr() as *const _,
+            ) != 0
+            {
+                return Err(self.status.as_error(&self.ibase));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn restore(&mut self, svc_handle: &mut Self::SvcHandle, config: &RestoreConfiguration) -> Result<(), FbError> {
+        todo!()
+    }
+}
+
 impl<T: LinkageMarker> NativeFbClient<T> {
     /// Build the dpb and the connection string
     ///
@@ -729,4 +904,50 @@ impl<T: LinkageMarker> NativeFbClient<T> {
 
         (dpb, conn_string)
     }
+
+    fn build_spb(
+        &mut self,
+        config: &NativeFbAttachmentConfig,
+    ) -> (Vec<u8>, String) {
+        let user = &config.user;
+        let mut password = None;
+        let svc_name = &config.db_name; // TODO rename svc_name
+
+        let svc_conn_string = match &config.remote {
+            None => svc_name.clone(),
+            Some(remote_conf) => {
+                password = Some(remote_conf.pass.as_str());
+                format!(
+                    "{}/{}:{}",
+                    remote_conf.host.as_str(),
+                    remote_conf.port,
+                    svc_name.as_str()
+                )
+            }
+        };
+
+        let spb = {
+            let mut spb: Vec<u8> = Vec::with_capacity(64);
+
+            spb.extend(&[ibase::isc_spb_version1 as u8]);
+
+            spb.extend(&[ibase::isc_spb_user_name as u8, user.len() as u8]);
+            spb.extend(user.bytes());
+
+            if let Some(pass_str) = password {
+                spb.extend(&[ibase::isc_spb_password as u8, pass_str.len() as u8]);
+                spb.extend(pass_str.bytes());
+            };
+
+            if let Some(role) = &config.role_name {
+                spb.extend(&[ibase::isc_spb_sql_role_name as u8, role.len() as u8]);
+                spb.extend(role.bytes());
+            }
+
+            spb
+        };
+
+        (spb, svc_conn_string)
+    }
+
 }

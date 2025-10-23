@@ -20,7 +20,7 @@ pub mod builders {
     use super::{
         super::{charset, Charset},
         Connection, ConnectionConfiguration, Dialect, FbError, FirebirdClient,
-        FirebirdClientFactory,
+        FirebirdClientFactory, SvcConnection, FirebirdSvcClient
     };
 
     #[cfg(feature = "native_client")]
@@ -448,6 +448,38 @@ where
 
             Ok(f_res)
         })
+    }
+}
+
+/// A connection to a firebird service
+pub struct SvcConnection<C: FirebirdSvcClient> {
+    /// Service handler
+    pub(crate) handle: <C as FirebirdClientSvcOps>::SvcHandle,
+
+    /// Firebird client
+    pub(crate) cli: C,
+}
+
+impl<C: FirebirdSvcClient> SvcConnection<C> {
+    /// Open the client connection.
+    pub fn open(
+        mut cli: C,
+        conf: &ConnectionConfiguration<C::AttachmentConfig>,
+    ) -> Result<SvcConnection<C>, FbError> {
+        let handle = cli.attach_service(&conf.attachment_conf)?;
+
+        Ok(SvcConnection {
+            handle,
+            cli,
+        })
+    }
+
+    /// Close the current connection.
+    pub fn close(mut self) -> Result<(), FbError> {
+        self.cli.detach_service(&mut self.handle)?;
+        mem::forget(self);
+
+        Ok(())
     }
 }
 

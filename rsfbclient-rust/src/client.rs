@@ -19,6 +19,7 @@ use crate::{
 use rsfbclient_core::*;
 
 type RustDbHandle = DbHandle;
+type RustSvcHandle = SvcHandle;
 type RustTrHandle = TrHandle;
 type RustStmtHandle = StmtHandle;
 
@@ -271,6 +272,50 @@ impl FirebirdClientSqlOps for RustFbClient {
         self.conn
             .as_mut()
             .map(|conn| conn.fetch(tr_handle, stmt_handle))
+            .unwrap_or_else(err_client_not_connected)
+    }
+}
+
+impl FirebirdClientSvcOps for RustFbClient {
+    type SvcHandle = RustSvcHandle;
+    type AttachmentConfig = RustFbClientAttachmentConfig;
+
+    fn attach_service(&mut self, config: &Self::AttachmentConfig) -> Result<Self::SvcHandle, FbError> {
+        let host = config.host.as_str();
+        let port = config.port;
+        let db_name = config.db_name.as_str();
+        let user = config.user.as_str();
+        let pass = config.pass.as_str();
+        let role = match &config.role_name {
+            Some(ro) => Some(ro.as_str()),
+            None => None,
+        };
+
+        // Take the existing connection, or connects
+        let mut conn = match self.conn.take() {
+            Some(conn) => conn,
+            None => FirebirdWireConnection::connect(
+                host,
+                port,
+                db_name,
+                user,
+                pass,
+                self.charset.clone(),
+            )?,
+        };
+
+        let attach_result = conn.service_attach(db_name, user, pass, role);
+
+        // Put the connection back
+        self.conn.replace(conn);
+
+        attach_result
+    }
+
+    fn detach_service(&mut self, svc_handle: &mut Self::SvcHandle) -> Result<(), FbError> {
+        self.conn
+            .as_mut()
+            .map(|conn| conn.service_detach(svc_handle))
             .unwrap_or_else(err_client_not_connected)
     }
 }
@@ -869,6 +914,74 @@ impl FirebirdWireConnection {
         Ok(())
     }
 
+    /// Connect to a service, returning a service handle
+    pub fn service_attach(
+        &mut self,
+        svc_name: &str,
+        user: &str,
+        pass: &str,
+        role_name: Option<&str>,
+    ) -> Result<SvcHandle, FbError> {
+        self.socket.write_all(&service_attach(
+            svc_name,
+            user,
+            pass,
+            self.version,
+            role_name.clone(),
+        ))?;
+        self.socket.flush()?;
+
+        let resp = self.read_response()?;
+
+        Ok(SvcHandle(resp.handle))
+    }
+
+    /// Disconnect from the service
+    pub fn service_detach(&mut self, svc_handle: &mut SvcHandle) -> Result<(), FbError> {
+        self.socket.write_all(&service_detach(svc_handle.0))?;
+        self.socket.flush()?;
+
+        self.read_response()?;
+
+        Ok(())
+    }
+
+    pub fn backup(
+        &mut self,
+        svc_handle: SvcHandle,
+        db_name: &str,
+        backup_files: Vec<BackupFile>,
+        backup_configuration: BackupConfiguration,
+    ) -> Result<String, FbError> {
+        self.service_start(svc_handle, &build_backup(db_name, backup_files, backup_configuration))?;
+
+        let mut spb = BytesMut::with_capacity(1);
+        spb.put_u8(ibase::isc_info_svc_to_eof as u8);
+
+        let output = self.service_query(svc_handle, &spb.freeze())?;
+
+        Ok(output)
+    }
+
+    fn service_start(&mut self, svc_handle: SvcHandle, spb: &Bytes) -> Result<(), FbError> {
+        self.socket.write_all(&start_service(svc_handle.0, &spb))?;
+        self.socket.flush()?;
+
+        self.read_response()?;
+
+        Ok(())
+    }
+
+    pub fn service_query(&mut self, svc_handle: SvcHandle, spb: &Bytes) -> Result<String, FbError> {
+        self.socket.write_all(&query_service(svc_handle.0, &spb))?;
+        self.socket.flush()?;
+
+        let resp = self.read_response()?;
+        let output = parse_service_query(resp.data)?;
+
+        Ok(output)
+    }
+
     /// Read a server response
     fn read_response(&mut self) -> Result<Response, FbError> {
         read_response(&mut self.socket, &mut self.buff, &mut self.lazy_count)
@@ -989,6 +1102,10 @@ where
 #[derive(Debug, Clone, Copy)]
 /// A database handle
 pub struct DbHandle(u32);
+
+#[derive(Debug, Clone, Copy)]
+/// A service handle
+pub struct SvcHandle(u32);
 
 #[derive(Debug, Clone, Copy)]
 /// A transaction handle

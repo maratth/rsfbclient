@@ -9,6 +9,7 @@ pub mod ibase;
 mod params;
 mod row;
 mod transaction;
+mod service;
 
 pub use charset::Charset;
 pub use connection::*;
@@ -16,6 +17,7 @@ pub use error::FbError;
 pub use params::*;
 pub use row::*;
 pub use transaction::*;
+pub use service::*;
 
 #[derive(Debug, Clone)]
 /// Sql parameter / column data

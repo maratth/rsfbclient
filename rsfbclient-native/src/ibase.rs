@@ -1203,41 +1203,41 @@ parse_functions! {
     // extern "C" {
     //     pub fn isc_baddress_s(arg1: *const ISC_SCHAR, arg2: *mut usize);
     // }
-    // extern "C" {
-    //     pub fn isc_service_attach(
-    //         arg1: *mut ISC_STATUS,
-    //         arg2: ::std::os::raw::c_ushort,
-    //         arg3: *const ISC_SCHAR,
-    //         arg4: *mut isc_svc_handle,
-    //         arg5: ::std::os::raw::c_ushort,
-    //         arg6: *const ISC_SCHAR,
-    //     ) -> ISC_STATUS;
-    // }
-    // extern "C" {
-    //     pub fn isc_service_detach(arg1: *mut ISC_STATUS, arg2: *mut isc_svc_handle) -> ISC_STATUS;
-    // }
-    // extern "C" {
-    //     pub fn isc_service_query(
-    //         arg1: *mut ISC_STATUS,
-    //         arg2: *mut isc_svc_handle,
-    //         arg3: *mut isc_resv_handle,
-    //         arg4: ::std::os::raw::c_ushort,
-    //         arg5: *const ISC_SCHAR,
-    //         arg6: ::std::os::raw::c_ushort,
-    //         arg7: *const ISC_SCHAR,
-    //         arg8: ::std::os::raw::c_ushort,
-    //         arg9: *mut ISC_SCHAR,
-    //     ) -> ISC_STATUS;
-    // }
-    // extern "C" {
-    //     pub fn isc_service_start(
-    //         arg1: *mut ISC_STATUS,
-    //         arg2: *mut isc_svc_handle,
-    //         arg3: *mut isc_resv_handle,
-    //         arg4: ::std::os::raw::c_ushort,
-    //         arg5: *const ISC_SCHAR,
-    //     ) -> ISC_STATUS;
-    // }
+    extern "C" {
+        pub fn isc_service_attach(
+            arg1: *mut ISC_STATUS,
+            arg2: ::std::os::raw::c_ushort,
+            arg3: *const ISC_SCHAR,
+            arg4: *mut isc_svc_handle,
+            arg5: ::std::os::raw::c_ushort,
+            arg6: *const ISC_SCHAR,
+        ) -> ISC_STATUS;
+    }
+    extern "C" {
+        pub fn isc_service_detach(arg1: *mut ISC_STATUS, arg2: *mut isc_svc_handle) -> ISC_STATUS;
+    }
+    extern "C" {
+        pub fn isc_service_query(
+            arg1: *mut ISC_STATUS,
+            arg2: *mut isc_svc_handle,
+            arg3: *mut isc_resv_handle,
+            arg4: ::std::os::raw::c_ushort,
+            arg5: *const ISC_SCHAR,
+            arg6: ::std::os::raw::c_ushort,
+            arg7: *const ISC_SCHAR,
+            arg8: ::std::os::raw::c_ushort,
+            arg9: *mut ISC_SCHAR,
+        ) -> ISC_STATUS;
+    }
+    extern "C" {
+        pub fn isc_service_start(
+            arg1: *mut ISC_STATUS,
+            arg2: *mut isc_svc_handle,
+            arg3: *mut isc_resv_handle,
+            arg4: ::std::os::raw::c_ushort,
+            arg5: *const ISC_SCHAR,
+        ) -> ISC_STATUS;
+    }
     // extern "C" {
     //     pub fn fb_shutdown(
     //         arg1: ::std::os::raw::c_uint,

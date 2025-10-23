@@ -92,6 +92,7 @@ mod query;
 mod statement;
 mod transaction;
 mod utils;
+mod service;
 
 pub use crate::{
     connection::{Connection, ConnectionConfiguration, FirebirdClientFactory, SimpleConnection},
