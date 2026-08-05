@@ -33,22 +33,17 @@ fn fetch_batch_size() -> u32 {
         .unwrap_or(200)
 }
 
-/// Result of parsing ONE op_fetch_response.
+/// Result of parsing ONE op_fetch_response. Blob columns are still unresolved:
+/// fetching them costs extra round-trips that must not be interleaved with the
+/// responses of the running batch (see `fetch_batch`).
 enum FetchOne {
     /// A row (status=0, messages=1).
-    Row(Vec<Column>),
+    Row(Vec<ParsedColumn>),
     /// End of THIS batch (status=0, messages=0): the server ended the op_fetch
     /// without exhausting the cursor. Re-issuing op_fetch fetches the rest.
     BatchEnd,
     /// End of cursor (status=100). Nothing more to read.
     End,
-}
-
-enum FetchErr {
-    /// Not enough bytes in the buffer — read more from the socket and retry.
-    NeedMore,
-    /// A real protocol/server error — propagate it.
-    Fatal(FbError),
 }
 
 /// Firebird client implemented in pure rust
@@ -76,8 +71,17 @@ pub struct FirebirdWireConnection {
     /// Wire protocol version
     pub(crate) version: ProtocolVersion,
 
-    /// Buffer to read the network data
+    /// Scratch buffer for a single socket read
     buff: Box<[u8]>,
+
+    /// Bytes received from the socket but not consumed yet.
+    ///
+    /// The wire protocol is a byte stream with no packet framing, so one read()
+    /// can return half a response or several responses at once. Whatever is left
+    /// over after parsing has to survive until the next read — dropping it (as
+    /// the old per-call buffer did) desynchronises the stream and every later
+    /// operation reads garbage as its op code.
+    pending: Bytes,
 
     /// Lazy responses to read
     lazy_count: u32,
@@ -348,15 +352,15 @@ impl FirebirdWireConnection {
 
         // May be a bit too much
         let mut buff = vec![0; BUFFER_LENGTH as usize * 2].into_boxed_slice();
-
-        let len = socket.read(&mut buff)?;
-        let mut resp = Bytes::copy_from_slice(&buff[..len]);
+        let mut pending = Bytes::new();
 
         let ConnectionResponse {
             version,
             mut auth_plugin,
             continue_auth,
-        } = parse_accept(&mut resp)?;
+        } = read_with(&mut socket, &mut buff, &mut pending, &mut 0, |resp, _| {
+            parse_accept(resp)
+        })?;
 
         if let Some(auth_plugin) = &mut auth_plugin {
             loop {
@@ -367,8 +371,16 @@ impl FirebirdWireConnection {
                         if let Some(data) = auth_plugin.data.clone() {
                             if continue_auth {
                                 // Continue autentication if needed
-                                socket =
-                                    srp_auth(socket, &mut buff, srp, plugin, user, pass, &data)?;
+                                socket = srp_auth(
+                                    socket,
+                                    &mut buff,
+                                    &mut pending,
+                                    srp,
+                                    plugin,
+                                    user,
+                                    pass,
+                                    &data,
+                                )?;
                             }
 
                             // Authentication Ok
@@ -385,10 +397,13 @@ impl FirebirdWireConnection {
                             ))?;
                             socket.flush()?;
 
-                            let len = socket.read(&mut buff)?;
-                            let mut resp = Bytes::copy_from_slice(&buff[..len]);
-
-                            *auth_plugin = parse_cont_auth(&mut resp)?;
+                            *auth_plugin = read_with(
+                                &mut socket,
+                                &mut buff,
+                                &mut pending,
+                                &mut 0,
+                                |resp, _| parse_cont_auth(resp),
+                            )?;
                         }
                     }
                     plugin @ AuthPluginType::Srp256 => {
@@ -397,8 +412,16 @@ impl FirebirdWireConnection {
                         if let Some(data) = auth_plugin.data.clone() {
                             if continue_auth {
                                 // Continue autentication if needed
-                                socket =
-                                    srp_auth(socket, &mut buff, srp, plugin, user, pass, &data)?;
+                                socket = srp_auth(
+                                    socket,
+                                    &mut buff,
+                                    &mut pending,
+                                    srp,
+                                    plugin,
+                                    user,
+                                    pass,
+                                    &data,
+                                )?;
                             }
 
                             // Authentication Ok
@@ -415,10 +438,13 @@ impl FirebirdWireConnection {
                             ))?;
                             socket.flush()?;
 
-                            let len = socket.read(&mut buff)?;
-                            let mut resp = Bytes::copy_from_slice(&buff[..len]);
-
-                            *auth_plugin = parse_cont_auth(&mut resp)?;
+                            *auth_plugin = read_with(
+                                &mut socket,
+                                &mut buff,
+                                &mut pending,
+                                &mut 0,
+                                |resp, _| parse_cont_auth(resp),
+                            )?;
                         }
                     }
                 }
@@ -429,6 +455,7 @@ impl FirebirdWireConnection {
             socket,
             version,
             buff,
+            pending,
             lazy_count: 0,
             charset,
             auth_plugin: if continue_auth {
@@ -607,41 +634,42 @@ impl FirebirdWireConnection {
         )?)?;
         self.socket.flush()?;
 
-        let (mut op_code, mut resp) = self.read_packet()?;
+        // Both responses (alloc + prepare) come back in one go. The prepare one
+        // carries the xsqlda and is easily larger than a single read for a wide
+        // table, so it has to be read until it is complete.
+        let (stmt_handle, mut prepare_data) = read_with(
+            &mut self.socket,
+            &mut self.buff,
+            &mut self.pending,
+            &mut self.lazy_count,
+            |resp, lazy_count| {
+                // Alloc resp
+                let op_code = skip_lazy_responses(resp, lazy_count)?;
+                if op_code != WireOp::Response as u32 {
+                    return err_conn_rejected(op_code);
+                }
+                let stmt_handle = StmtHandle(parse_response(resp)?.handle);
 
-        // Read lazy responses
-        for _ in 0..self.lazy_count {
-            if op_code != WireOp::Response as u32 {
-                return err_conn_rejected(op_code);
-            }
-            self.lazy_count -= 1;
-            parse_response(&mut resp)?;
+                // Prepare resp
+                let op_code = next_op_code(resp)?;
+                if op_code != WireOp::Response as u32 {
+                    return err_conn_rejected(op_code);
+                }
 
-            op_code = resp.get_u32()?;
-        }
+                Ok((stmt_handle, parse_response(resp)?.data))
+            },
+        )?;
 
-        // Alloc resp
-        if op_code != WireOp::Response as u32 {
-            return err_conn_rejected(op_code);
-        }
-
-        let stmt_handle = StmtHandle(parse_response(&mut resp)?.handle);
-
-        // Prepare resp
-        let op_code = resp.get_u32()?;
-
-        if op_code != WireOp::Response as u32 {
-            return err_conn_rejected(op_code);
-        }
-
+        // Parsed outside the retry above: `data` is length-delimited inside the
+        // response, so it is complete by construction here, and parse_xsqlda
+        // appends to `xsqlda` — retrying it would duplicate columns.
         let mut xsqlda = Vec::new();
 
-        let mut resp = parse_response(&mut resp)?;
         let PrepareInfo {
             stmt_type,
             mut param_count,
             mut truncated,
-        } = parse_xsqlda(&mut resp.data, &mut xsqlda)?;
+        } = parse_xsqlda(&mut prepare_data, &mut xsqlda)?;
 
         while truncated {
             // Get more info on the types
@@ -782,33 +810,38 @@ impl FirebirdWireConnection {
         ))?;
         self.socket.flush()?;
 
-        let (mut op_code, mut resp) = read_packet(&mut self.socket, &mut self.buff)?;
+        let version = self.version;
+        let charset = self.charset.clone();
+        let xsqlda = &stmt_handle.xsqlda;
 
-        // Read lazy responses
-        for _ in 0..self.lazy_count {
-            if op_code != WireOp::Response as u32 {
-                return err_conn_rejected(op_code);
-            }
-            self.lazy_count -= 1;
-            parse_response(&mut resp)?;
+        let parsed_cols = read_with(
+            &mut self.socket,
+            &mut self.buff,
+            &mut self.pending,
+            &mut self.lazy_count,
+            |resp, lazy_count| {
+                let op_code = skip_lazy_responses(resp, lazy_count)?;
 
-            op_code = resp.get_u32()?;
-        }
+                if op_code == WireOp::Response as u32 {
+                    // An error ocurred
+                    parse_response(resp)?;
+                }
 
-        if op_code == WireOp::Response as u32 {
-            // An error ocurred
-            parse_response(&mut resp)?;
-        }
+                if op_code != WireOp::SqlResponse as u32 {
+                    return err_conn_rejected(op_code);
+                }
 
-        if op_code != WireOp::SqlResponse as u32 {
-            return err_conn_rejected(op_code);
-        }
+                let parsed_cols = parse_sql_response(resp, xsqlda, version, &charset)?;
 
-        let parsed_cols =
-            parse_sql_response(&mut resp, &stmt_handle.xsqlda, self.version, &self.charset)?;
+                parse_response(resp)?;
 
-        parse_response(&mut resp)?;
+                Ok(parsed_cols)
+            },
+        )?;
 
+        // Only now, with the response above fully consumed, is it safe to run the
+        // extra round-trips a blob column needs: issuing them earlier would read
+        // the blob replies from behind the still-unparsed bytes of this response.
         let mut cols = Vec::with_capacity(parsed_cols.len());
 
         for pc in parsed_cols {
@@ -842,10 +875,7 @@ impl FirebirdWireConnection {
     }
 
     /// Requests `count` rows in one op_fetch and reads every op_fetch_response
-    /// that arrives, filling `stmt_handle.prefetched`. Parses greedily; if bytes
-    /// are missing mid-response, reads more from the socket and resumes (robust
-    /// against responses split across TCP segments — the cause of the old
-    /// "Invalid server response, missing bytes").
+    /// that arrives, filling `stmt_handle.prefetched`.
     fn fetch_batch(
         &mut self,
         tr_handle: &mut TrHandle,
@@ -856,159 +886,62 @@ impl FirebirdWireConnection {
             .write_all(&fetch(stmt_handle.handle.0, &stmt_handle.blr, count))?;
         self.socket.flush()?;
 
-        let mut acc = BytesMut::new();
+        let version = self.version;
+        let charset = self.charset.clone();
+        let xsqlda = &stmt_handle.xsqlda;
+
+        // Read the whole batch before touching any blob. Resolving a blob costs
+        // its own round-trips, and starting one while later rows of this batch
+        // are still unparsed would make the blob replies queue up behind them.
+        let mut rows: Vec<Vec<ParsedColumn>> = Vec::new();
+        let mut cursor_eof = false;
         let mut got = 0u32;
 
         loop {
-            // Parse as many responses as the accumulated bytes allow.
-            let mut view = std::mem::take(&mut acc).freeze();
-            loop {
-                let snapshot = view.clone(); // O(1): Bytes shares the underlying buffer
-                let saved_lazy = self.lazy_count;
-                match self.parse_one_fetch_response(&mut view, &stmt_handle.xsqlda, tr_handle) {
-                    Ok(FetchOne::Row(cols)) => {
-                        stmt_handle.prefetched.push_back(cols);
-                        got += 1;
-                        // Do NOT return on got>=count: after the rows, the server
-                        // always sends a terminating op_fetch_response (messages=0
-                        // = end of this batch, or status=100 = end of cursor).
-                        // Returning early would discard that terminator (still
-                        // buffered) and desync the next op_fetch. Let BatchEnd/End
-                        // end the loop. Guard against a server sending more rows
-                        // than requested (should not happen).
-                        if got > count {
-                            return Err("server sent more rows than requested in op_fetch".into());
-                        }
+            let one = read_with(
+                &mut self.socket,
+                &mut self.buff,
+                &mut self.pending,
+                &mut self.lazy_count,
+                |resp, lazy_count| {
+                    parse_one_fetch_response(resp, lazy_count, xsqlda, version, &charset)
+                },
+            )?;
+
+            match one {
+                FetchOne::Row(cols) => {
+                    rows.push(cols);
+                    got += 1;
+                    // Do NOT stop on got>=count: after the rows, the server always
+                    // sends a terminating op_fetch_response (messages=0 = end of
+                    // this batch, or status=100 = end of cursor). Let BatchEnd/End
+                    // end the loop, so the terminator is consumed. Guard against a
+                    // server sending more rows than requested (should not happen).
+                    if got > count {
+                        return Err("server sent more rows than requested in op_fetch".into());
                     }
-                    Ok(FetchOne::BatchEnd) => {
-                        // Server ended this op_fetch without exhausting the cursor.
-                        // Deliver what arrived; the next fetch() re-issues op_fetch.
-                        return Ok(());
-                    }
-                    Ok(FetchOne::End) => {
-                        stmt_handle.cursor_eof = true;
-                        return Ok(());
-                    }
-                    Err(FetchErr::NeedMore) => {
-                        self.lazy_count = saved_lazy; // undo partial lazy consumption
-                        view = snapshot;
-                        break;
-                    }
-                    Err(FetchErr::Fatal(e)) => return Err(e),
                 }
-            }
-
-            // Missing bytes: keep the unconsumed tail and read more from the socket.
-            let mut next = BytesMut::from(view.as_ref());
-            let n = self.socket.read(&mut self.buff)?;
-            if n == 0 {
-                return Err("Fetch: connection closed mid-batch".into());
-            }
-            next.extend_from_slice(&self.buff[..n]);
-            acc = next;
-        }
-    }
-
-    /// Tries to parse ONE op_fetch_response from `view`. On NeedMore, the caller
-    /// restores `view` from a snapshot (the partial consumption here is discarded).
-    fn parse_one_fetch_response(
-        &mut self,
-        view: &mut Bytes,
-        xsqlda: &[XSqlVar],
-        tr_handle: &mut TrHandle,
-    ) -> Result<FetchOne, FetchErr> {
-        // op_code, skipping Dummy packets
-        let mut op_code = loop {
-            if view.remaining() < 4 {
-                return Err(FetchErr::NeedMore);
-            }
-            let oc = view.get_u32().map_err(|_| FetchErr::NeedMore)?;
-            if oc != WireOp::Dummy as u32 {
-                break oc;
-            }
-        };
-
-        // Pending lazy responses
-        for _ in 0..self.lazy_count {
-            if op_code != WireOp::Response as u32 {
-                return Err(FetchErr::Fatal(
-                    format!("unexpected op_code in fetch (op {})", op_code).into(),
-                ));
-            }
-            self.lazy_count -= 1;
-            parse_response(view).map_err(|_| FetchErr::NeedMore)?;
-            if view.remaining() < 4 {
-                return Err(FetchErr::NeedMore);
-            }
-            op_code = view.get_u32().map_err(|_| FetchErr::NeedMore)?;
-        }
-
-        if op_code == WireOp::Response as u32 {
-            // Error reported by the server
-            parse_response(view).map_err(FetchErr::Fatal)?;
-        }
-
-        if op_code != WireOp::FetchResponse as u32 {
-            return Err(FetchErr::Fatal(
-                format!("unexpected op_code in fetch (op {})", op_code).into(),
-            ));
-        }
-
-        // Body: [status: u32][messages: u32][null_map][columns...]. Peek status
-        // and messages without consuming, to tell end-of-cursor (status=100),
-        // end-of-batch (messages=0) and a row (messages=1) apart BEFORE delegating.
-        if view.remaining() < 4 {
-            return Err(FetchErr::NeedMore);
-        }
-        let status = {
-            let mut peek = view.clone();
-            peek.get_u32().map_err(|_| FetchErr::NeedMore)?
-        };
-        if status == 100 {
-            // End of cursor: consume only the status (same as parse_fetch_response).
-            view.advance(4).map_err(|_| FetchErr::NeedMore)?;
-            return Ok(FetchOne::End);
-        }
-        if view.remaining() < 8 {
-            return Err(FetchErr::NeedMore);
-        }
-        let messages = {
-            let mut peek = view.clone();
-            peek.get_u32().map_err(|_| FetchErr::NeedMore)?; // status
-            peek.get_u32().map_err(|_| FetchErr::NeedMore)? // messages
-        };
-        if messages == 0 {
-            // End of this batch with no row: consume status+messages, stop the batch.
-            view.advance(8).map_err(|_| FetchErr::NeedMore)?;
-            return Ok(FetchOne::BatchEnd);
-        }
-
-        // A row is present. Delegate to the crate parser (re-reads status+messages+data).
-        // charset cloned so we don't hold a borrow of self when calling into_column.
-        let version = self.version;
-        let charset = self.charset.clone();
-        match parse_fetch_response(view, xsqlda, version, &charset) {
-            Ok(None) => Ok(FetchOne::End),
-            Ok(Some(parsed)) => {
-                let mut cols = Vec::with_capacity(parsed.len());
-                for pc in parsed {
-                    cols.push(pc.into_column(self, tr_handle).map_err(FetchErr::Fatal)?);
-                }
-                Ok(FetchOne::Row(cols))
-            }
-            // Underflow (bytes missing mid-response) has a fixed message -> read
-            // more and resume. Any OTHER error (e.g. invalid UTF-8 when decoding a
-            // column) is a real data error: propagate it, don't turn it into an
-            // infinite wait for bytes that never arrive.
-            Err(e) => {
-                if matches!(&e, FbError::Other(m) if m == "Invalid server response, missing bytes")
-                {
-                    Err(FetchErr::NeedMore)
-                } else {
-                    Err(FetchErr::Fatal(e))
+                // Server ended this op_fetch without exhausting the cursor.
+                // Deliver what arrived; the next fetch() re-issues op_fetch.
+                FetchOne::BatchEnd => break,
+                FetchOne::End => {
+                    cursor_eof = true;
+                    break;
                 }
             }
         }
+
+        stmt_handle.cursor_eof = cursor_eof;
+
+        for parsed in rows {
+            let mut cols = Vec::with_capacity(parsed.len());
+            for pc in parsed {
+                cols.push(pc.into_column(self, tr_handle)?);
+            }
+            stmt_handle.prefetched.push_back(cols);
+        }
+
+        Ok(())
     }
 
     /// Create a new blob, returning the blob handle and id
@@ -1088,12 +1021,150 @@ impl FirebirdWireConnection {
 
     /// Read a server response
     fn read_response(&mut self) -> Result<Response, FbError> {
-        read_response(&mut self.socket, &mut self.buff, &mut self.lazy_count)
+        read_response(
+            &mut self.socket,
+            &mut self.buff,
+            &mut self.pending,
+            &mut self.lazy_count,
+        )
+    }
+}
+
+/// Reads from `socket` until `parse` succeeds against the accumulated bytes,
+/// then keeps the unconsumed tail in `pending` for the next call.
+///
+/// This is the only correct way to read a Firebird response: the protocol has no
+/// packet framing, so a response is complete exactly when it parses. A single
+/// read() may return a partial response — the parse then underflows and we read
+/// more instead of handing a truncated buffer to the caller — or several
+/// responses at once, in which case the surplus stays in `pending` rather than
+/// being dropped and leaving the stream misaligned.
+///
+/// `parse` may consume from `lazy_count`; a failed attempt is rolled back so the
+/// retry starts from the same state.
+fn read_with<T>(
+    socket: &mut impl Read,
+    buff: &mut [u8],
+    pending: &mut Bytes,
+    lazy_count: &mut u32,
+    mut parse: impl FnMut(&mut Bytes, &mut u32) -> Result<T, FbError>,
+) -> Result<T, FbError> {
+    loop {
+        // O(1): Bytes shares the underlying allocation
+        let mut view = pending.clone();
+        let saved_lazy = *lazy_count;
+
+        match parse(&mut view, lazy_count) {
+            Ok(parsed) => {
+                // Commit: `view` is what the parse did not consume.
+                *pending = view;
+                return Ok(parsed);
+            }
+
+            Err(e) if is_incomplete(&e) => {
+                // Undo the partial consumption and wait for the rest.
+                *lazy_count = saved_lazy;
+
+                let len = socket.read(buff)?;
+                if len == 0 {
+                    return Err("Connection closed by the server".into());
+                }
+
+                let mut next = BytesMut::with_capacity(pending.len() + len);
+                next.put_slice(pending);
+                next.put_slice(&buff[..len]);
+                *pending = next.freeze();
+            }
+
+            // A server-reported error is a fully parsed response, so commit it:
+            // leaving its bytes in `pending` would make the next operation parse
+            // them again.
+            Err(e) => {
+                *pending = view;
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Reads the next op code, skipping `op_dummy` keepalives.
+fn next_op_code(resp: &mut Bytes) -> Result<u32, FbError> {
+    loop {
+        let op_code = resp.get_u32()?;
+
+        if op_code != WireOp::Dummy as u32 {
+            return Ok(op_code);
+        }
+    }
+}
+
+/// Consumes the lazy responses pending before the response we actually want.
+fn skip_lazy_responses(resp: &mut Bytes, lazy_count: &mut u32) -> Result<u32, FbError> {
+    let mut op_code = next_op_code(resp)?;
+
+    while *lazy_count > 0 {
+        if op_code != WireOp::Response as u32 {
+            return err_conn_rejected(op_code);
+        }
+        *lazy_count -= 1;
+        parse_response(resp)?;
+
+        op_code = next_op_code(resp)?;
     }
 
-    /// Reads a packet from the socket
-    fn read_packet(&mut self) -> Result<(u32, Bytes), FbError> {
-        read_packet(&mut self.socket, &mut self.buff)
+    Ok(op_code)
+}
+
+/// Parses ONE op_fetch_response. Blob columns are returned unresolved — see
+/// `fetch_batch`.
+fn parse_one_fetch_response(
+    resp: &mut Bytes,
+    lazy_count: &mut u32,
+    xsqlda: &[XSqlVar],
+    version: ProtocolVersion,
+    charset: &Charset,
+) -> Result<FetchOne, FbError> {
+    let op_code = skip_lazy_responses(resp, lazy_count)?;
+
+    if op_code == WireOp::Response as u32 {
+        // Error reported by the server
+        parse_response(resp)?;
+    }
+
+    if op_code != WireOp::FetchResponse as u32 {
+        return Err(format!("unexpected op_code in fetch (op {})", op_code).into());
+    }
+
+    // Body: [status: u32][messages: u32][null_map][columns...]. Peek both
+    // without consuming, to tell end-of-cursor (status=100), end-of-batch
+    // (messages=0) and a row (messages=1) apart before delegating.
+    if resp.remaining() < 8 {
+        return err_invalid_response();
+    }
+    let (status, messages) = {
+        let mut peek = resp.clone();
+        (peek.get_u32()?, peek.get_u32()?)
+    };
+
+    if status == 100 {
+        // End of cursor. Consume status AND messages: the server always sends
+        // both, but parse_fetch_response stops after the status, which used to
+        // leave four bytes in the stream for the next operation to read as its
+        // op code (op 0 -> "Connection rejected with code 0").
+        resp.advance(8)?;
+        return Ok(FetchOne::End);
+    }
+
+    if messages == 0 {
+        // End of this batch with no row.
+        resp.advance(8)?;
+        return Ok(FetchOne::BatchEnd);
+    }
+
+    // A row is present. Delegate to the crate parser (re-reads status+messages+data).
+    match parse_fetch_response(resp, xsqlda, version, charset)? {
+        Some(parsed) => Ok(FetchOne::Row(parsed)),
+        None => Ok(FetchOne::End),
     }
 }
 
@@ -1101,53 +1172,18 @@ impl FirebirdWireConnection {
 fn read_response(
     socket: &mut impl Read,
     buff: &mut [u8],
+    pending: &mut Bytes,
     lazy_count: &mut u32,
 ) -> Result<Response, FbError> {
-    let (mut op_code, mut resp) = read_packet(socket, buff)?;
+    read_with(socket, buff, pending, lazy_count, |resp, lazy_count| {
+        let op_code = skip_lazy_responses(resp, lazy_count)?;
 
-    // Read lazy responses
-    for _ in 0..*lazy_count {
         if op_code != WireOp::Response as u32 {
             return err_conn_rejected(op_code);
         }
-        *lazy_count -= 1;
-        parse_response(&mut resp)?;
 
-        op_code = resp.get_u32()?;
-    }
-
-    if op_code != WireOp::Response as u32 {
-        return err_conn_rejected(op_code);
-    }
-
-    parse_response(&mut resp)
-}
-
-/// Reads a packet from the socket
-fn read_packet(socket: &mut impl Read, buff: &mut [u8]) -> Result<(u32, Bytes), FbError> {
-    let mut len = socket.read(buff)?;
-    let mut resp = BytesMut::from(&buff[..len]);
-
-    loop {
-        if len == buff.len() {
-            // The buffer was not large enough, so read more
-            len = socket.read(buff)?;
-            resp.put_slice(&buff[..len]);
-        } else {
-            break;
-        }
-    }
-    let mut resp = resp.freeze();
-
-    let op_code = loop {
-        let op_code = resp.get_u32()?;
-
-        if op_code != WireOp::Dummy as u32 {
-            break op_code;
-        }
-    };
-
-    Ok((op_code, resp))
+        parse_response(resp)
+    })
 }
 
 pub(crate) fn srp_verifier<D>(
@@ -1175,6 +1211,7 @@ where
 fn srp_auth<D>(
     mut socket: FbStream,
     buff: &mut [u8],
+    pending: &mut Bytes,
     srp: SrpClient<D>,
     plugin: AuthPluginType,
     user: &str,
@@ -1198,7 +1235,7 @@ where
     ))?;
     socket.flush()?;
 
-    read_response(&mut socket, buff, &mut 0)?;
+    read_response(&mut socket, buff, pending, &mut 0)?;
 
     // Enable wire encryption
     socket.write_all(&crypt("Arc4", "Symmetric"))?;
@@ -1213,7 +1250,7 @@ where
         buff.len(),
     ));
 
-    read_response(&mut socket, buff, &mut 0)?;
+    read_response(&mut socket, buff, pending, &mut 0)?;
 
     Ok(socket)
 }
@@ -1269,6 +1306,118 @@ impl Write for FbStream {
             FbStream::Plain(s) => s.flush(),
             FbStream::Arc4(s) => s.flush(),
         }
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use rsfbclient_core::charset::UTF_8;
+
+    /// A `Read` that hands out at most `chunk` bytes at a time — what a response
+    /// split across TCP segments looks like to the client.
+    struct Chunked {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl Read for Chunked {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.chunk.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// One op_response: handle, object_id, empty data, empty status vector.
+    fn op_response(handle: u32) -> Vec<u8> {
+        let mut b = BytesMut::new();
+        b.put_u32(WireOp::Response as u32);
+        b.put_u32(handle);
+        b.put_u64(0); // object_id
+        b.put_wire_bytes(&[]); // data
+        b.put_u32(ibase::isc_arg_end); // status vector
+        b.to_vec()
+    }
+
+    fn read_one(data: Vec<u8>, chunk: usize) -> (Result<Response, FbError>, Bytes) {
+        let mut socket = Chunked {
+            data,
+            pos: 0,
+            chunk,
+        };
+        let mut buff = vec![0u8; 2048];
+        let mut pending = Bytes::new();
+
+        let resp = read_response(&mut socket, &mut buff, &mut pending, &mut 0);
+        (resp, pending)
+    }
+
+    /// A response delivered one byte at a time must be reassembled, not
+    /// truncated. This is the bug behind "Invalid Xsqlda received from server"
+    /// and "Invalid server response, missing bytes".
+    #[test]
+    fn reassembles_response_split_across_reads() {
+        let packet = op_response(42);
+
+        for chunk in [1, 2, 3, 5, 7, 11, packet.len() - 1] {
+            let (resp, pending) = read_one(packet.clone(), chunk);
+            let resp = resp.unwrap_or_else(|e| panic!("chunk {chunk}: {e}"));
+
+            assert_eq!(resp.handle, 42, "chunk {chunk}");
+            assert!(pending.is_empty(), "chunk {chunk}: {} left", pending.len());
+        }
+    }
+
+    /// Two responses arriving in one read: the second must survive in `pending`.
+    /// Dropping it is what desynchronised the stream and made the next operation
+    /// read a random u32 as its op code ("Connection rejected with code ...").
+    #[test]
+    fn keeps_surplus_bytes_for_the_next_read() {
+        let mut data = op_response(1);
+        data.extend_from_slice(&op_response(2));
+        let len = data.len();
+
+        let mut socket = Chunked {
+            data,
+            pos: 0,
+            chunk: len, // both responses in a single read
+        };
+        let mut buff = vec![0u8; 2048];
+        let mut pending = Bytes::new();
+
+        let first = read_response(&mut socket, &mut buff, &mut pending, &mut 0).unwrap();
+        assert_eq!(first.handle, 1);
+        assert!(!pending.is_empty(), "second response was dropped");
+
+        // The second read must be served from `pending` without touching the
+        // socket, which is now exhausted.
+        let second = read_response(&mut socket, &mut buff, &mut pending, &mut 0).unwrap();
+        assert_eq!(second.handle, 2);
+        assert!(pending.is_empty());
+    }
+
+    /// End-of-cursor is `[status=100][count]`; consuming only the status left the
+    /// count behind for the next operation to read as its op code.
+    #[test]
+    fn end_of_cursor_consumes_the_whole_response() {
+        let mut b = BytesMut::new();
+        b.put_u32(WireOp::FetchResponse as u32);
+        b.put_u32(100); // status: end of cursor
+        b.put_u32(0); // count — must be consumed too
+        let mut resp = b.freeze();
+
+        let one = parse_one_fetch_response(&mut resp, &mut 0, &[], ProtocolVersion::V13, &UTF_8)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        assert!(matches!(one, FetchOne::End));
+        assert!(
+            resp.is_empty(),
+            "{} bytes left for the next operation to trip over",
+            resp.len()
+        );
     }
 }
 

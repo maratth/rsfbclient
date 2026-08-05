@@ -176,8 +176,20 @@ impl BytesWireExt for Bytes {
     }
 }
 
+/// Message of the underflow error every accessor above returns. The wire
+/// protocol has no packet framing, so "the buffer ended early" is the only
+/// signal that a response is not complete yet and more bytes must be read from
+/// the socket before parsing can be retried.
+pub const ERR_MISSING_BYTES: &str = "Invalid server response, missing bytes";
+
 pub fn err_invalid_response<T>() -> Result<T, FbError> {
-    Err("Invalid server response, missing bytes".into())
+    Err(ERR_MISSING_BYTES.into())
+}
+
+/// Whether `e` means "the response is incomplete, read more" rather than a real
+/// protocol or server error.
+pub fn is_incomplete(e: &FbError) -> bool {
+    matches!(e, FbError::Other(msg) if msg == ERR_MISSING_BYTES)
 }
 
 pub fn err_conn_rejected<T>(op_code: u32) -> Result<T, FbError> {
