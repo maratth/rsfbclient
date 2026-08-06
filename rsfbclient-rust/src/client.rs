@@ -83,6 +83,11 @@ pub struct FirebirdWireConnection {
     lazy_count: u32,
 
     pub(crate) charset: Charset,
+
+    /// AuthPlugin data for use on attach when WireCrypt = Disabled
+    pub(crate) auth_plugin: Option<AuthPlugin>,
+    /// Key for the srp auth
+    pub(crate) srp_key: [u8; 32],
 }
 
 /// Data to keep track about a prepared statement
@@ -349,17 +354,22 @@ impl FirebirdWireConnection {
 
         let ConnectionResponse {
             version,
-            auth_plugin,
+            mut auth_plugin,
+            continue_auth,
         } = parse_accept(&mut resp)?;
 
-        if let Some(mut auth_plugin) = auth_plugin {
+        if let Some(auth_plugin) = &mut auth_plugin {
             loop {
                 match auth_plugin.kind {
                     plugin @ AuthPluginType::Srp => {
                         let srp = SrpClient::<sha1::Sha1>::new(&srp_key, &SRP_GROUP);
 
-                        if let Some(data) = auth_plugin.data {
-                            socket = srp_auth(socket, &mut buff, srp, plugin, user, pass, data)?;
+                        if let Some(data) = auth_plugin.data.clone() {
+                            if continue_auth {
+                                // Continue autentication if needed
+                                socket =
+                                    srp_auth(socket, &mut buff, srp, plugin, user, pass, &data)?;
+                            }
 
                             // Authentication Ok
                             break;
@@ -378,14 +388,18 @@ impl FirebirdWireConnection {
                             let len = socket.read(&mut buff)?;
                             let mut resp = Bytes::copy_from_slice(&buff[..len]);
 
-                            auth_plugin = parse_cont_auth(&mut resp)?;
+                            *auth_plugin = parse_cont_auth(&mut resp)?;
                         }
                     }
                     plugin @ AuthPluginType::Srp256 => {
                         let srp = SrpClient::<sha2::Sha256>::new(&srp_key, &SRP_GROUP);
 
-                        if let Some(data) = auth_plugin.data {
-                            socket = srp_auth(socket, &mut buff, srp, plugin, user, pass, data)?;
+                        if let Some(data) = auth_plugin.data.clone() {
+                            if continue_auth {
+                                // Continue autentication if needed
+                                socket =
+                                    srp_auth(socket, &mut buff, srp, plugin, user, pass, &data)?;
+                            }
 
                             // Authentication Ok
                             break;
@@ -404,7 +418,7 @@ impl FirebirdWireConnection {
                             let len = socket.read(&mut buff)?;
                             let mut resp = Bytes::copy_from_slice(&buff[..len]);
 
-                            auth_plugin = parse_cont_auth(&mut resp)?;
+                            *auth_plugin = parse_cont_auth(&mut resp)?;
                         }
                     }
                 }
@@ -417,6 +431,14 @@ impl FirebirdWireConnection {
             buff,
             lazy_count: 0,
             charset,
+            auth_plugin: if continue_auth {
+                // Already authenticated
+                None
+            } else {
+                // Needs to authenticate in attach
+                auth_plugin
+            },
+            srp_key,
         })
     }
 
@@ -437,9 +459,11 @@ impl FirebirdWireConnection {
             self.version,
             self.charset.clone(),
             page_size,
-            role_name.clone(),
+            role_name,
             dialect,
-        ))?;
+            self.auth_plugin.as_ref(),
+            &self.srp_key,
+        )?)?;
         self.socket.flush()?;
 
         let resp = self.read_response()?;
@@ -463,10 +487,12 @@ impl FirebirdWireConnection {
             pass,
             self.version,
             self.charset.clone(),
-            role_name.clone(),
+            role_name,
             dialect,
             no_db_triggers,
-        ))?;
+            self.auth_plugin.as_ref(),
+            &self.srp_key,
+        )?)?;
         self.socket.flush()?;
 
         let resp = self.read_response()?;
@@ -1124,16 +1150,12 @@ fn read_packet(socket: &mut impl Read, buff: &mut [u8]) -> Result<(u32, Bytes), 
     Ok((op_code, resp))
 }
 
-/// Performs the srp authentication with the server, returning the encrypted stream
-fn srp_auth<D>(
-    mut socket: FbStream,
-    buff: &mut [u8],
+pub(crate) fn srp_verifier<D>(
     srp: SrpClient<D>,
-    plugin: AuthPluginType,
     user: &str,
     pass: &str,
-    data: SrpAuthData,
-) -> Result<FbStream, FbError>
+    data: &SrpAuthData,
+) -> Result<SrpClientVerifier<D>, FbError>
 where
     D: digest::Digest,
 {
@@ -1144,6 +1166,25 @@ where
     let verifier = srp
         .process_reply(user.as_bytes(), &data.salt, &private_key, &data.pub_key)
         .map_err(|e| FbError::from(format!("Srp error: {}", e)))?;
+
+    // Generate a proof to send to the server so it can verify the password
+    Ok(verifier)
+}
+
+/// Performs the srp authentication with the server, returning the encrypted stream
+fn srp_auth<D>(
+    mut socket: FbStream,
+    buff: &mut [u8],
+    srp: SrpClient<D>,
+    plugin: AuthPluginType,
+    user: &str,
+    pass: &str,
+    data: &SrpAuthData,
+) -> Result<FbStream, FbError>
+where
+    D: digest::Digest,
+{
+    let verifier = srp_verifier(srp, user, pass, data)?;
 
     // Generate a proof to send to the server so it can verify the password
     let proof = hex::encode(verifier.get_proof());
