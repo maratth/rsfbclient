@@ -185,9 +185,7 @@ impl SimpleConnection {
             #[cfg(feature = "dynamic_loading")]
             TypeConnectionContainer::NativeDynLoad(c) => c.wait_for_event(name),
             #[cfg(feature = "pure_rust")]
-            TypeConnectionContainer::PureRust(c) => {
-                Err(FbError::from("Events only works with the native client"))
-            }
+            TypeConnectionContainer::PureRust(c) => c.wait_for_event(name),
         }
     }
 }

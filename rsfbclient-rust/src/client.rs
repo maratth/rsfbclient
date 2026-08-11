@@ -5,13 +5,14 @@ use std::{
     collections::VecDeque,
     env,
     io::{Read, Write},
-    net::TcpStream,
+    net::{SocketAddr, TcpStream},
 };
 
 use crate::{
     arc4::*,
     blr,
     consts::{AuthPluginType, ProtocolVersion, WireOp},
+    events::*,
     srp::*,
     util::*,
     wire::*,
@@ -88,6 +89,14 @@ pub struct FirebirdWireConnection {
     pub(crate) auth_plugin: Option<AuthPlugin>,
     /// Key for the srp auth
     pub(crate) srp_key: [u8; 32],
+
+    /// Auxiliary connection the server pushes the event notifications on.
+    /// Opened on the first wait, and reused afterwards: firebird keeps a single
+    /// auxiliary port per attachment
+    event_channel: Option<EventChannel>,
+
+    /// Id to use for the next event registration
+    next_event_id: u32,
 }
 
 /// Data to keep track about a prepared statement
@@ -313,6 +322,19 @@ impl FirebirdClientSqlOps for RustFbClient {
     }
 }
 
+impl FirebirdClientDbEvents for RustFbClient {
+    fn wait_for_event(
+        &mut self,
+        db_handle: &mut Self::DbHandle,
+        name: String,
+    ) -> Result<(), FbError> {
+        self.conn
+            .as_mut()
+            .map(|conn| conn.wait_for_event(db_handle, &name))
+            .unwrap_or_else(err_client_not_connected)
+    }
+}
+
 fn err_client_not_connected<T>() -> Result<T, FbError> {
     Err("Client not connected to the server, call `attach_database` to connect".into())
 }
@@ -439,6 +461,8 @@ impl FirebirdWireConnection {
                 auth_plugin
             },
             srp_key,
+            event_channel: None,
+            next_event_id: 1,
         })
     }
 
@@ -502,6 +526,9 @@ impl FirebirdWireConnection {
 
     /// Disconnect from the database
     pub fn detach_database(&mut self, db_handle: &mut DbHandle) -> Result<(), FbError> {
+        // The server drops the auxiliary port along with the attachment
+        self.close_event_channel();
+
         self.socket.write_all(&detach(db_handle.0))?;
         self.socket.flush()?;
 
@@ -512,12 +539,141 @@ impl FirebirdWireConnection {
 
     /// Drop the database
     pub fn drop_database(&mut self, db_handle: &mut DbHandle) -> Result<(), FbError> {
+        // The server drops the auxiliary port along with the attachment
+        self.close_event_channel();
+
         self.socket.write_all(&drop_database(db_handle.0))?;
         self.socket.flush()?;
 
         self.read_response()?;
 
         Ok(())
+    }
+
+    /// Wait until `name` is posted on the database.
+    ///
+    /// Blocks the connection: the notification arrives on the auxiliary
+    /// channel, but registering the interest and acknowledging it both happen
+    /// on this connection.
+    pub fn wait_for_event(&mut self, db_handle: &mut DbHandle, name: &str) -> Result<(), FbError> {
+        let name = normalize_event_name(name)?;
+
+        self.open_event_channel(db_handle)?;
+
+        // Firebird considers an interest satisfied as soon as the counter it
+        // holds for the event has reached the counter of the registration, so
+        // registering with a counter of zero always fires straight away. That
+        // first notification carries the current counter and is a
+        // synchronization, not an event. The native client has to do the very
+        // same thing, hence its two `isc_wait_for_event` calls.
+        let event_id = self.new_event_id();
+        let counters = self.que_events(db_handle, name, 0, event_id)?;
+        let posted = event_count(&counters, name)?;
+
+        // Now that the current counter is known, register again: this time the
+        // server only answers once the event is really posted
+        let event_id = self.new_event_id();
+        self.que_events(db_handle, name, posted, event_id)?;
+
+        Ok(())
+    }
+
+    /// Allocate the id of a new event registration.
+    ///
+    /// Every registration gets its own id, so the notification of a previous
+    /// one can never be taken for the one being waited on. Zero is skipped:
+    /// firebird uses it to mark a registration as already handled.
+    fn new_event_id(&mut self) -> u32 {
+        let event_id = self.next_event_id;
+
+        self.next_event_id = self.next_event_id.wrapping_add(1).max(1);
+
+        event_id
+    }
+
+    /// Register an interest in `name` and block until the server notifies it.
+    ///
+    /// Returns the occurrence counters of the notification.
+    fn que_events(
+        &mut self,
+        db_handle: &mut DbHandle,
+        name: &str,
+        count: u32,
+        event_id: u32,
+    ) -> Result<Vec<(String, u32)>, FbError> {
+        // Encoded with the charset of the connection, like every other string
+        // this connection sends
+        let epb = event_block(&self.charset, [(name, count)])?;
+
+        self.socket
+            .write_all(&que_events(db_handle.0, &epb, event_id))?;
+        self.socket.flush()?;
+
+        // The registration is acknowledged here, the notification itself comes
+        // later on the auxiliary channel
+        self.read_response()?;
+
+        let channel = match self.event_channel.as_mut() {
+            Some(channel) => channel,
+            None => return Err(FbError::from("The event channel was closed")),
+        };
+
+        match channel.recv_event(event_id) {
+            Ok(counters) => Ok(counters),
+
+            Err(err) => {
+                // The notification will never arrive, so release the
+                // registration the server is still holding. Best effort: the
+                // whole connection may be gone.
+                self.event_channel = None;
+                self.cancel_events(db_handle, event_id).ok();
+
+                Err(err)
+            }
+        }
+    }
+
+    /// Cancel a pending event registration
+    fn cancel_events(&mut self, db_handle: &mut DbHandle, event_id: u32) -> Result<(), FbError> {
+        self.socket
+            .write_all(&cancel_events(db_handle.0, event_id))?;
+        self.socket.flush()?;
+
+        self.read_response()?;
+
+        Ok(())
+    }
+
+    /// Open the auxiliary connection the event notifications are pushed on, if
+    /// it is not already open for this database handle
+    fn open_event_channel(&mut self, db_handle: &mut DbHandle) -> Result<(), FbError> {
+        if matches!(&self.event_channel, Some(channel) if channel.db_handle() == db_handle.0) {
+            return Ok(());
+        }
+        self.event_channel = None;
+
+        self.socket.write_all(&connect_request(db_handle.0))?;
+        self.socket.flush()?;
+
+        let resp = self.read_response()?;
+        let port = parse_aux_port(&resp.data)?;
+
+        // The server is listening by the time it answered, so connect now: it
+        // gives up on the auxiliary port after `ConnectionTimeout` seconds
+        let peer = self.socket.peer_addr()?;
+        self.event_channel = Some(EventChannel::open(
+            db_handle.0,
+            self.charset.clone(),
+            peer,
+            port,
+        )?);
+
+        Ok(())
+    }
+
+    /// Close the auxiliary event connection, if any
+    fn close_event_channel(&mut self) {
+        self.event_channel = None;
     }
 
     /// Start a new transaction, with the specified transaction parameter buffer
@@ -1245,6 +1401,16 @@ enum FbStream {
 
     /// Arc4 ecrypted stream
     Arc4(Arc4Stream<TcpStream>),
+}
+
+impl FbStream {
+    /// Address of the server this stream is connected to
+    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            FbStream::Plain(s) => s.peer_addr(),
+            FbStream::Arc4(s) => s.peer_addr(),
+        }
+    }
 }
 
 impl Read for FbStream {

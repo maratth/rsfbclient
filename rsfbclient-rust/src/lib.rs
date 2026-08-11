@@ -4,6 +4,7 @@ mod arc4;
 mod blr;
 mod client;
 mod consts;
+mod events;
 mod srp;
 mod util;
 mod wire;
