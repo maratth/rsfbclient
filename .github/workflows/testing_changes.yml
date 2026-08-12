@@ -8,8 +8,6 @@
 # TODO:
 #   - Run tests in arm little-endian architecture (travis-ci?)
 #   - Test cross compilation to many arch (E.g ripgrep)
-#   - cargo tarpaulin does not work on windows
-#   - cargo tarpaulin does not work on macos
 #   - cargo test fails with linking on macos
 
 on:
@@ -262,19 +260,15 @@ jobs:
           command: test
           args: --manifest-path rsfbclient-diesel/Cargo.toml --no-default-features --features '${{ matrix.features_diesel }}' -- --test-threads 1
 
-      - name: Run cargo-tarpaulin on rsfbclient
-        uses: actions-rs/tarpaulin@v0.1
-        if: matrix.plataform == 'linux'
-        # TODO: #[error]The process 'C:\Rust\.cargo\bin\cargo.exe' failed with exit code 101: error: no such subcommand: `tarpaulin`
-        with:
-          version: "0.22.0"
-          run-types: "AllTargets"
-          out-type: "Lcov"
-          args: -v --line --count --branch --no-default-features --features '${{ matrix.features }}' -- --test-threads 1
+      - name: Install cargo-llvm-cov on rsfbclient
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate Code Coverage
+        run: cargo llvm-cov --lcov --output-path lcov.info --no-default-features --features '${{ matrix.features }}' -- --test-threads 1
 
       - name: Coveralls Parallel on rsfbclient
         uses: coverallsapp/github-action@master
-        if: matrix.plataform == 'linux'
+        #if: matrix.plataform == 'linux'
         env:
           COVERALLS_FLAG_NAME: run-${{ matrix.firebird }}-${{ matrix.build }}-rsfbclient
         with:
@@ -283,19 +277,12 @@ jobs:
           parallel: true
           # flag-name: run-${{ matrix.firebird }}-${{ matrix.build }}
 
-      - name: Run cargo-tarpaulin on rsfbclient-rust
-        uses: actions-rs/tarpaulin@v0.1
-        if: matrix.plataform == 'linux'
-        # TODO: #[error]The process 'C:\Rust\.cargo\bin\cargo.exe' failed with exit code 101: error: no such subcommand: `tarpaulin`
-        with:
-          version: "0.22.0"
-          run-types: "AllTargets"
-          out-type: "Lcov"
-          args: -v --line --count --branch -p rsfbclient-rust
+      - name: Generate Code Coverage on rsfbclient-rust
+        run: cargo llvm-cov --lcov --output-path lcov.info -p rsfbclient-rust
 
       - name: Coveralls Parallel on rsfbclient-rust
         uses: coverallsapp/github-action@master
-        if: matrix.plataform == 'linux'
+        #if: matrix.plataform == 'linux'
         env:
           COVERALLS_FLAG_NAME: run-${{ matrix.firebird }}-${{ matrix.build }}-rsfbclient-rust
         with:
@@ -304,19 +291,12 @@ jobs:
           parallel: true
           # flag-name: run-${{ matrix.firebird }}-${{ matrix.build }}
 
-      - name: Run cargo-tarpaulin on rsfbclient-diesel
-        uses: actions-rs/tarpaulin@v0.1
-        if: matrix.plataform == 'linux'
-        # TODO: #[error]The process 'C:\Rust\.cargo\bin\cargo.exe' failed with exit code 101: error: no such subcommand: `tarpaulin`
-        with:
-          version: "0.22.0"
-          run-types: "AllTargets"
-          out-type: "Lcov"
-          args: -v --line --count --branch --manifest-path rsfbclient-diesel/Cargo.toml --no-default-features --features '${{ matrix.features_diesel }}' -- --test-threads 1
+      - name: Generate Code Coverage on rsfbclient-diesel
+        run: cargo llvm-cov --lcov --output-path lcov.info --manifest-path rsfbclient-diesel/Cargo.toml --no-default-features --features '${{ matrix.features_diesel }}' -- --test-threads 1
 
       - name: Coveralls Parallel on rsfbclient-diesel
         uses: coverallsapp/github-action@master
-        if: matrix.plataform == 'linux'
+        #if: matrix.plataform == 'linux'
         env:
           COVERALLS_FLAG_NAME: run-${{ matrix.firebird }}-${{ matrix.build }}-rsfbclient-diesel
         with:
@@ -325,11 +305,13 @@ jobs:
           parallel: true
           # flag-name: run-${{ matrix.firebird }}-${{ matrix.build }}
 
-      - name: Cleanup docker and coverage
+      - name: Cleanup docker
         if: matrix.plataform == 'linux'
         run: |
           docker rm --volumes --force firebirdsql
-          rm -f ./lcov.info
+
+      - name: Cleanup coverage
+        run: rm -f ./lcov.info
 
   coverage:
     name: coverage
