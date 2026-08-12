@@ -14,8 +14,8 @@
 
 on:
   push:
-    paths-ignore:
-      - ".github/workflows/**"
+    #paths-ignore:
+    #  - ".github/workflows/**"
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review, labeled]
   workflow_dispatch:
