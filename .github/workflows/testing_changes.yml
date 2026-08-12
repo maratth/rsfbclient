@@ -159,6 +159,7 @@ jobs:
           sudo installer -verbose -pkg /tmp/firebird.pkg -target /
           sudo mkdir -p /usr/local/lib
           sudo ln -s /Library/Frameworks/Firebird.framework/Versions/A/Libraries/libfbclient.dylib /usr/local/lib/libfbclient.dylib
+          echo "DYLD_LIBRARY_PATH=/usr/local/lib:/Library/Frameworks/Firebird.framework/Versions/A/Libraries" >> "$GITHUB_ENV"
 
       - name: Locating fbclient.lib Dir on Windows
         if: matrix.plataform == 'windows'
@@ -310,8 +311,13 @@ jobs:
         run: |
           docker rm --volumes --force firebirdsql
 
-      - name: Cleanup coverage
+      - name: Cleanup coverage on unix
+        if: matrix.plataform != 'windows'
         run: rm -f ./lcov.info
+
+      - name: Cleanup coverage on Window
+        if: matrix.plataform == 'windows'
+        run: rm -Force .\lcov.info
 
   coverage:
     name: coverage
