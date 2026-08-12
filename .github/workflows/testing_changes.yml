@@ -18,6 +18,7 @@ on:
       - ".github/workflows/**"
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review, labeled]
+  workflow_dispatch:
 
 name: testing_changes
 
