@@ -86,7 +86,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ["ubuntu-20.04", "windows-latest", "macos-latest"]
+        os: ["ubuntu-24.04", "windows-latest", "macos-latest"]
         firebird: [v3, v2, v4, v5]
         build: [linking, dynamic_loading, pure_rust]
         exclude:
@@ -102,12 +102,12 @@ jobs:
             firebird: v4
           - os: "macos-latest"
             firebird: v5
-          - os: "ubuntu-20.04"
+          - os: "ubuntu-24.04"
             firebird: v5
           - os: "macos-latest"
             build: dynamic_loading
         include:
-          - os: "ubuntu-20.04"
+          - os: "ubuntu-24.04"
             plataform: linux
           - os: "windows-latest"
             plataform: windows
