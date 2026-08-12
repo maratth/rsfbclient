@@ -328,6 +328,11 @@ impl FirebirdWireConnection {
         charset: Charset,
     ) -> Result<Self, FbError> {
         let socket = TcpStream::connect((host, port))?;
+        // The wire protocol is request/response with small writes, so Nagle has
+        // nothing to coalesce and every statement waits out a delayed ACK
+        // (~40ms). Measured against Firebird 2.5: SELECT 1 FROM RDB$DATABASE
+        // 44ms -> 0.2ms, a 1000-row select 107ms -> 5.7ms.
+        let _ = socket.set_nodelay(true);
 
         // System username
         let username =
