@@ -48,7 +48,8 @@ fn search_on_macos() {
             "cargo:rustc-link-search=/Library/Frameworks/Firebird.framework/Versions/A/Libraries/"
         );
     }
-    println!("cargo:rustc-link-lib=dylib=libfbclient");
+    println!("cargo:rustc-link-lib=dylib=fbclient");
+    // println!("cargo:rustc-link-lib=dylib=libfbclient");
     // println!("cargo:rustc-link-lib=dylib=libfbclient.dylib");
     // println!("cargo:rustc-link-lib=framework=Firebird.framework");
 }
