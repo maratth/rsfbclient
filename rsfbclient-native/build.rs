@@ -21,6 +21,10 @@ fn search_on_environment_var() -> bool {
 
     if let Ok(user_specified_dir) = std::env::var("FBCLIENT_LIB_DIR") {
         println!("cargo:rustc-link-search={}", user_specified_dir);
+
+        #[cfg(all(feature = "linking", target_os = "windows"))]
+        search_libname_on_windows(&user_specified_dir);
+
         return false;
     }
     true
@@ -107,6 +111,33 @@ fn search_for_file(filename: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+#[cfg(all(feature = "linking", target_os = "windows"))]
+fn search_libname_on_windows(dir: &str) {
+    let dir = std::path::Path::new(dir);
+    if dir.join("fbclient_ms.lib").exists() {
+        println!("cargo:rustc-link-lib=dylib=fbclient_ms");
+    } else if dir.join("fbclient.lib").exists() {
+        println!("cargo:rustc-link-lib=dylib=fbclient");
+    } else {
+        let pattern = format!("{}\\\\*.lib", dir.display());
+        let found = glob(&pattern).expect("Failed to read glob pattern");
+        for entry in found {
+            if let Ok(path) = entry {
+                if let Some(stem) = path.file_stem() {
+                    if let Some(name) = stem.to_str() {
+                        println!("cargo:rustc-link-lib=dylib={}", name);
+                        return;
+                    }
+                }
+            }
+        }
+        println!(
+            "cargo:warning=No .lib file found in FBCLIENT_LIB_DIR ({})",
+            dir.display()
+        );
+    }
 }
 
 // end of code
