@@ -98,9 +98,9 @@ jobs:
           - os: "macos-latest"
             firebird: v2
           - os: "macos-latest"
-            firebird: v4
+            firebird: v3
           - os: "macos-latest"
-            firebird: v5
+            firebird: v4
           - os: "ubuntu-latest"
             firebird: v5
           - os: "macos-latest"
@@ -155,7 +155,7 @@ jobs:
         if: matrix.plataform == 'macos'
         shell: bash
         run: |
-          wget https://github.com/FirebirdSQL/firebird/releases/download/R3_0_6/Firebird-3.0.6-33328-x86_64.pkg -O /tmp/firebird.pkg
+          wget https://github.com/FirebirdSQL/firebird/releases/download/v5.0.4/Firebird-5.0.4.1812-0-macos-arm64.pkg -O /tmp/firebird.pkg
           sudo installer -verbose -pkg /tmp/firebird.pkg -target /
           sudo mkdir -p /usr/local/lib
           sudo ln -s /Library/Frameworks/Firebird.framework/Versions/A/Libraries/libfbclient.dylib /usr/local/lib/libfbclient.dylib
