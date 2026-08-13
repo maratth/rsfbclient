@@ -159,7 +159,7 @@ jobs:
           sudo installer -verbose -pkg /tmp/firebird.pkg -target /
           sudo mkdir -p /usr/local/lib
           sudo ln -s /Library/Frameworks/Firebird.framework/Versions/A/Libraries/libfbclient.dylib /usr/local/lib/libfbclient.dylib
-          echo "DYLD_LIBRARY_PATH=/usr/local/lib:/Library/Frameworks/Firebird.framework/Versions/A/Libraries" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=/usr/local/lib:/Library/Frameworks/Firebird.framework/Versions/A/Libraries:/Library/Frameworks/Firebird.framework/Versions/A/Resources/lib" >> "$GITHUB_ENV"
 
       - name: Locating fbclient.lib Dir on Windows
         if: matrix.plataform == 'windows'
