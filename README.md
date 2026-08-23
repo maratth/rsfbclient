@@ -18,5 +18,3 @@ A [Firebird](https://firebirdsql.org/) client library to [Rust programing langua
 - [x] Dynamic loading the fbclient(.dll or .so)
 - [x] ARM support
 - [x] Firebird embedded support
-
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/L3L843YUI)
