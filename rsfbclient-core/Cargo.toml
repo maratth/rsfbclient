@@ -13,7 +13,7 @@ license = "MIT"
 chrono = { version = "0.4.19", features = ["clock", "std"], default-features = false }
 num_enum = "0.5.7"
 thiserror = "1.0.24"
-encoding = "0.2.33"
+encoding-next = "0.3"
 regex = "1.4.3"
 
 [features]
