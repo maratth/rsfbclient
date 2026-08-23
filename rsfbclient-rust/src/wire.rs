@@ -3,7 +3,7 @@
 #![allow(non_upper_case_globals)]
 
 use bytes::{BufMut, Bytes, BytesMut};
-use std::{convert::TryFrom, str};
+use std::{borrow::Cow, convert::TryFrom, str};
 
 use crate::{
     client::{BlobId, FirebirdWireConnection},
@@ -141,7 +141,9 @@ pub fn attach(
     role_name: Option<&str>,
     dialect: Dialect,
     no_db_triggers: bool,
-) -> Bytes {
+    auth_plugin: Option<&AuthPlugin>,
+    srp_key: &[u8; 32],
+) -> Result<Bytes, FbError> {
     let dpb = build_dpb(
         user,
         pass,
@@ -151,7 +153,9 @@ pub fn attach(
         role_name,
         dialect,
         no_db_triggers,
-    );
+        auth_plugin,
+        srp_key,
+    )?;
 
     let mut attach = BytesMut::with_capacity(16 + db_name.len() + dpb.len());
 
@@ -162,7 +166,7 @@ pub fn attach(
 
     attach.put_wire_bytes(&dpb);
 
-    attach.freeze()
+    Ok(attach.freeze())
 }
 
 /// Create db request
@@ -175,10 +179,21 @@ pub fn create(
     page_size: Option<u32>,
     role_name: Option<&str>,
     dialect: Dialect,
-) -> Bytes {
+    auth_plugin: Option<&AuthPlugin>,
+    srp_key: &[u8; 32],
+) -> Result<Bytes, FbError> {
     let dpb = build_dpb(
-        user, pass, protocol, charset, page_size, role_name, dialect, false,
-    );
+        user,
+        pass,
+        protocol,
+        charset,
+        page_size,
+        role_name,
+        dialect,
+        false,
+        auth_plugin,
+        srp_key,
+    )?;
 
     let mut create = BytesMut::with_capacity(16 + db_name.len() + dpb.len());
 
@@ -189,7 +204,7 @@ pub fn create(
 
     create.put_wire_bytes(&dpb);
 
-    create.freeze()
+    Ok(create.freeze())
 }
 
 /// Dpb builder
@@ -202,42 +217,56 @@ fn build_dpb(
     role_name: Option<&str>,
     dialect: Dialect,
     no_db_triggers: bool,
-) -> Bytes {
-    let mut dpb = BytesMut::with_capacity(64);
-
-    dpb.put_u8(1); //Version
+    auth_plugin: Option<&AuthPlugin>,
+    srp_key: &[u8; 32],
+) -> Result<Bytes, FbError> {
+    let mut params = Vec::new();
 
     if let Some(ps) = page_size {
-        dpb.put_slice(&[ibase::isc_dpb_page_size as u8, 4]);
-        dpb.put_u32(ps);
+        params.push(DpbData {
+            tag: ibase::isc_dpb_page_size as u8,
+            data: ps.to_be_bytes().to_vec().into(),
+        });
     }
 
     let charset = charset.on_firebird.as_bytes();
 
-    dpb.put_slice(&[ibase::isc_dpb_lc_ctype as u8, charset.len() as u8]);
-    dpb.put_slice(charset);
+    params.push(DpbData {
+        tag: ibase::isc_dpb_lc_ctype as u8,
+        data: charset.into(),
+    });
 
-    dpb.put_slice(&[ibase::isc_dpb_user_name as u8, user.len() as u8]);
-    dpb.put_slice(user.as_bytes());
+    params.push(DpbData {
+        tag: ibase::isc_dpb_user_name as u8,
+        data: user.as_bytes().into(),
+    });
 
     if let Some(role) = role_name {
-        dpb.extend(&[ibase::isc_dpb_sql_role_name as u8, role.len() as u8]);
-        dpb.extend(role.bytes());
+        params.push(DpbData {
+            tag: ibase::isc_dpb_sql_role_name as u8,
+            data: role.as_bytes().into(),
+        });
     }
 
-    dpb.extend(&[ibase::isc_dpb_sql_dialect as u8, 1 as u8]);
-    dpb.extend(&[dialect as u8]);
+    params.push(DpbData {
+        tag: ibase::isc_dpb_sql_dialect as u8,
+        data: vec![dialect as u8].into(),
+    });
 
     if no_db_triggers {
-        dpb.extend(&[ibase::isc_dpb_no_db_triggers as u8, 1 as u8]);
-        dpb.extend(&[1 as u8]);
+        params.push(DpbData {
+            tag: ibase::isc_dpb_no_db_triggers as u8,
+            data: vec![1].into(),
+        });
     }
 
     match protocol {
         // Plaintext password
         ProtocolVersion::V10 => {
-            dpb.put_slice(&[ibase::isc_dpb_password as u8, pass.len() as u8]);
-            dpb.put_slice(pass.as_bytes());
+            params.push(DpbData {
+                tag: ibase::isc_dpb_password as u8,
+                data: pass.as_bytes().to_vec().into(),
+            });
         }
 
         // Hashed password
@@ -246,12 +275,79 @@ fn build_dpb(
             let enc_pass = pwhash::unix_crypt::hash_with("9z", pass).unwrap();
             let enc_pass = &enc_pass[2..];
 
-            dpb.put_slice(&[ibase::isc_dpb_password_enc as u8, enc_pass.len() as u8]);
-            dpb.put_slice(enc_pass.as_bytes());
+            params.push(DpbData {
+                tag: ibase::isc_dpb_password_enc as u8,
+                data: enc_pass.as_bytes().to_vec().into(),
+            });
+        }
+
+        ProtocolVersion::V13
+            if let Some(auth) = auth_plugin
+                && let Some(auth_data) = &auth.data =>
+        {
+            // Password not verified on cont_auth (WireCrypt = Disabled)
+            params.push(DpbData {
+                tag: ibase::isc_dpb_auth_plugin_name as u8,
+                data: auth.kind.name().as_bytes().into(),
+            });
+
+            params.push(DpbData {
+                tag: ibase::isc_dpb_auth_plugin_list as u8,
+                data: AuthPluginType::plugin_list().into_bytes().into(),
+            });
+
+            let proof = {
+                match auth.kind {
+                    AuthPluginType::Srp => {
+                        let srp = SrpClient::<sha1::Sha1>::new(srp_key, &SRP_GROUP);
+                        let verifier = crate::client::srp_verifier(srp, user, pass, auth_data)?;
+
+                        hex::encode(verifier.get_proof())
+                    }
+                    AuthPluginType::Srp256 => {
+                        let srp = SrpClient::<sha2::Sha256>::new(srp_key, &SRP_GROUP);
+                        let verifier = crate::client::srp_verifier(srp, user, pass, auth_data)?;
+
+                        hex::encode(verifier.get_proof())
+                    }
+                }
+            };
+
+            params.push(DpbData {
+                tag: ibase::isc_dpb_specific_auth_data as u8,
+                data: proof.into_bytes().into(),
+            });
         }
 
         // Password already verified
         ProtocolVersion::V13 => {}
+    }
+
+    Ok(dpb(&params))
+}
+
+struct DpbData<'a> {
+    tag: u8,
+    data: Cow<'a, [u8]>,
+}
+
+fn dpb(data: &[DpbData<'_>]) -> Bytes {
+    let max_len = data.iter().map(|d| d.data.len()).max().unwrap_or_default();
+
+    let mut dpb = BytesMut::with_capacity(64);
+
+    let v2 = max_len < 255;
+
+    dpb.put_u8(if v2 { 2 } else { 1 }); //Version
+
+    for d in data {
+        dpb.put_u8(d.tag);
+        if v2 {
+            dpb.put_u32_le(d.data.len() as u32);
+        } else {
+            dpb.put_u8(d.data.len() as u8);
+        }
+        dpb.put_slice(&d.data);
     }
 
     dpb.freeze()
@@ -876,6 +972,7 @@ pub fn parse_status_vector(resp: &mut Bytes) -> Result<(), FbError> {
 pub struct ConnectionResponse {
     pub version: ProtocolVersion,
     pub auth_plugin: Option<AuthPlugin>,
+    pub continue_auth: bool,
 }
 
 #[derive(Debug)]
@@ -900,6 +997,8 @@ pub fn parse_accept(resp: &mut Bytes) -> Result<ConnectionResponse, FbError> {
     {
         return err_conn_rejected(op_code);
     }
+
+    let continue_auth = op_code == WireOp::CondAccept as u32;
 
     let version =
         ProtocolVersion::try_from(resp.get_u32()?).map_err(|e| FbError::Other(e.to_string()))?;
@@ -932,6 +1031,7 @@ pub fn parse_accept(resp: &mut Bytes) -> Result<ConnectionResponse, FbError> {
     Ok(ConnectionResponse {
         version,
         auth_plugin,
+        continue_auth,
     })
 }
 
@@ -960,7 +1060,7 @@ pub fn parse_cont_auth(resp: &mut Bytes) -> Result<AuthPlugin, FbError> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SrpAuthData {
     pub salt: Box<[u8]>,
     pub pub_key: Box<[u8]>,

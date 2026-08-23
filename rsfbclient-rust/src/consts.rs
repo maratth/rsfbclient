@@ -166,7 +166,7 @@ pub enum Cnct {
     ClientCrypt = 11,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum AuthPluginType {
     Srp256,
     Srp,

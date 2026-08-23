@@ -4,12 +4,11 @@
 # Using:
 #   - https://github.com/actions-rs/toolchain   -> https://github.com/marketplace/actions/rust-toolchain
 #   - https://github.com/actions-rs/cargo       -> https://github.com/marketplace/actions/rust-cargo
+#   - https://github.com/taiki-e/install-action -> https://github.com/marketplace/actions/install-development-tools
 #
 # TODO:
 #   - Run tests in arm little-endian architecture (travis-ci?)
 #   - Test cross compilation to many arch (E.g ripgrep)
-#   - cargo tarpaulin does not work on windows
-#   - cargo tarpaulin does not work on macos
 #   - cargo test fails with linking on macos
 
 on:
@@ -86,7 +85,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ["ubuntu-20.04", "windows-latest", "macos-latest"]
+        os: ["ubuntu-latest", "windows-latest", "macos-latest"]
         firebird: [v3, v2, v4, v5]
         build: [linking, dynamic_loading, pure_rust]
         exclude:
@@ -99,15 +98,18 @@ jobs:
           - os: "macos-latest"
             firebird: v2
           - os: "macos-latest"
-            firebird: v4
+            firebird: v3
           - os: "macos-latest"
-            firebird: v5
-          - os: "ubuntu-20.04"
+            firebird: v4
+          - os: "ubuntu-latest"
+            firebird: v2
+            build: pure_rust
+          - os: "ubuntu-latest"
             firebird: v5
           - os: "macos-latest"
             build: dynamic_loading
         include:
-          - os: "ubuntu-20.04"
+          - os: "ubuntu-latest"
             plataform: linux
           - os: "windows-latest"
             plataform: windows
@@ -156,10 +158,11 @@ jobs:
         if: matrix.plataform == 'macos'
         shell: bash
         run: |
-          wget https://github.com/FirebirdSQL/firebird/releases/download/R3_0_6/Firebird-3.0.6-33328-x86_64.pkg -O /tmp/firebird.pkg
+          wget https://github.com/FirebirdSQL/firebird/releases/download/v5.0.4/Firebird-5.0.4.1812-0-macos-arm64.pkg -O /tmp/firebird.pkg
           sudo installer -verbose -pkg /tmp/firebird.pkg -target /
           sudo mkdir -p /usr/local/lib
           sudo ln -s /Library/Frameworks/Firebird.framework/Versions/A/Libraries/libfbclient.dylib /usr/local/lib/libfbclient.dylib
+          echo "DYLD_LIBRARY_PATH=/usr/local/lib:/Library/Frameworks/Firebird.framework/Versions/A/Libraries:/Library/Frameworks/Firebird.framework/Versions/A/Resources/lib" >> "$GITHUB_ENV"
 
       - name: Locating fbclient.lib Dir on Windows
         if: matrix.plataform == 'windows'
@@ -261,19 +264,15 @@ jobs:
           command: test
           args: --manifest-path rsfbclient-diesel/Cargo.toml --no-default-features --features '${{ matrix.features_diesel }}' -- --test-threads 1
 
-      - name: Run cargo-tarpaulin on rsfbclient
-        uses: actions-rs/tarpaulin@v0.1
-        if: matrix.plataform == 'linux'
-        # TODO: #[error]The process 'C:\Rust\.cargo\bin\cargo.exe' failed with exit code 101: error: no such subcommand: `tarpaulin`
-        with:
-          version: "0.22.0"
-          run-types: "AllTargets"
-          out-type: "Lcov"
-          args: -v --line --count --branch --no-default-features --features '${{ matrix.features }}' -- --test-threads 1
+      - name: Install cargo-llvm-cov on rsfbclient
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate Code Coverage
+        run: cargo llvm-cov --lcov --output-path lcov.info --no-default-features --features '${{ matrix.features }}' -- --test-threads 1
 
       - name: Coveralls Parallel on rsfbclient
         uses: coverallsapp/github-action@master
-        if: matrix.plataform == 'linux'
+        #if: matrix.plataform == 'linux'
         env:
           COVERALLS_FLAG_NAME: run-${{ matrix.firebird }}-${{ matrix.build }}-rsfbclient
         with:
@@ -282,19 +281,12 @@ jobs:
           parallel: true
           # flag-name: run-${{ matrix.firebird }}-${{ matrix.build }}
 
-      - name: Run cargo-tarpaulin on rsfbclient-rust
-        uses: actions-rs/tarpaulin@v0.1
-        if: matrix.plataform == 'linux'
-        # TODO: #[error]The process 'C:\Rust\.cargo\bin\cargo.exe' failed with exit code 101: error: no such subcommand: `tarpaulin`
-        with:
-          version: "0.22.0"
-          run-types: "AllTargets"
-          out-type: "Lcov"
-          args: -v --line --count --branch -p rsfbclient-rust
+      - name: Generate Code Coverage on rsfbclient-rust
+        run: cargo llvm-cov --lcov --output-path lcov.info -p rsfbclient-rust
 
       - name: Coveralls Parallel on rsfbclient-rust
         uses: coverallsapp/github-action@master
-        if: matrix.plataform == 'linux'
+        #if: matrix.plataform == 'linux'
         env:
           COVERALLS_FLAG_NAME: run-${{ matrix.firebird }}-${{ matrix.build }}-rsfbclient-rust
         with:
@@ -303,19 +295,12 @@ jobs:
           parallel: true
           # flag-name: run-${{ matrix.firebird }}-${{ matrix.build }}
 
-      - name: Run cargo-tarpaulin on rsfbclient-diesel
-        uses: actions-rs/tarpaulin@v0.1
-        if: matrix.plataform == 'linux'
-        # TODO: #[error]The process 'C:\Rust\.cargo\bin\cargo.exe' failed with exit code 101: error: no such subcommand: `tarpaulin`
-        with:
-          version: "0.22.0"
-          run-types: "AllTargets"
-          out-type: "Lcov"
-          args: -v --line --count --branch --manifest-path rsfbclient-diesel/Cargo.toml --no-default-features --features '${{ matrix.features_diesel }}' -- --test-threads 1
+      - name: Generate Code Coverage on rsfbclient-diesel
+        run: cargo llvm-cov --lcov --output-path lcov.info --manifest-path rsfbclient-diesel/Cargo.toml --no-default-features --features '${{ matrix.features_diesel }}' -- --test-threads 1
 
       - name: Coveralls Parallel on rsfbclient-diesel
         uses: coverallsapp/github-action@master
-        if: matrix.plataform == 'linux'
+        #if: matrix.plataform == 'linux'
         env:
           COVERALLS_FLAG_NAME: run-${{ matrix.firebird }}-${{ matrix.build }}-rsfbclient-diesel
         with:
@@ -324,11 +309,18 @@ jobs:
           parallel: true
           # flag-name: run-${{ matrix.firebird }}-${{ matrix.build }}
 
-      - name: Cleanup docker and coverage
+      - name: Cleanup docker
         if: matrix.plataform == 'linux'
         run: |
           docker rm --volumes --force firebirdsql
-          rm -f ./lcov.info
+
+      - name: Cleanup coverage on unix
+        if: matrix.plataform != 'windows'
+        run: rm -f ./lcov.info
+
+      - name: Cleanup coverage on Window
+        if: matrix.plataform == 'windows'
+        run: rm -Force .\lcov.info
 
   coverage:
     name: coverage
