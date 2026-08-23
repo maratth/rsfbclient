@@ -338,7 +338,11 @@ fn dpb(data: &[DpbData<'_>]) -> Bytes {
 
     let v2 = max_len > 255;
 
-    dpb.put_u8(if v2 { ibase::isc_dpb_version2 } else { ibase::isc_dpb_version1 } as u8); //Version
+    dpb.put_u8(if v2 {
+        ibase::isc_dpb_version2
+    } else {
+        ibase::isc_dpb_version1
+    } as u8); //Version
 
     for d in data {
         dpb.put_u8(d.tag);
