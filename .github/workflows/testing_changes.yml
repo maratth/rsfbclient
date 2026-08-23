@@ -164,33 +164,57 @@ jobs:
           sudo ln -s /Library/Frameworks/Firebird.framework/Versions/A/Libraries/libfbclient.dylib /usr/local/lib/libfbclient.dylib
           echo "DYLD_LIBRARY_PATH=/usr/local/lib:/Library/Frameworks/Firebird.framework/Versions/A/Libraries:/Library/Frameworks/Firebird.framework/Versions/A/Resources/lib" >> "$GITHUB_ENV"
 
-      - name: Locating fbclient.lib Dir on Windows
+      - name: Locate and expose fbclient lib and dll (Windows)
         if: matrix.plataform == 'windows'
-        shell: powershell
+        shell: pwsh
         run: |
-          function Search-Common-Folders() {
-            param (
-                [string]$FileName
-            )
-            $WinSysDir = [Environment]::SystemDirectory
-            $CommonDirs = @(
-                "C:\Program Files\Firebird",
-                "C:\Firebird",
-                "${WinSysDir}"
-                )
-            Foreach ($folder in $CommonDirs) {
-              echo "# Finding relevant files in FirebirdSQL install:"
-              $found = Get-ChildItem -File -Recurse -Path $folder -Include $FileName -ea 0
-              Foreach ($source in $found) {
-                echo "  - $source"
-                Copy-Item -Path $source
-              }
-            }
+          # Search common install locations for fbclient .lib/.dll (recursively)
+          $common = @(
+            "C:\Program Files\Firebird",
+            "C:\Firebird",
+            "$env:WINDIR\System32",
+            "$env:ProgramFiles(x86)\Firebird"
+          )
+
+          $foundLib = $null
+          foreach ($folder in $common) {
+            if (-not (Test-Path $folder)) { continue }
+            $foundLib = Get-ChildItem -Path $folder -Include "fbclient.lib","fbclient_ms.lib" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($foundLib) { break }
           }
-          Search-Common-Folders -FileName "fbclient.dll"
-          Search-Common-Folders -FileName "fbclient.lib"
-          Search-Common-Folders -FileName "fbclient_ms.lib"
-          Search-Common-Folders -FileName "isql.exe"
+
+          $foundDll = $null
+          foreach ($folder in $common) {
+            if (-not (Test-Path $folder)) { continue }
+            $foundDll = Get-ChildItem -Path $folder -Include "fbclient.dll" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($foundDll) { break }
+          }
+
+          if (-not $foundLib) {
+            Write-Error "fbclient .lib not found. Ensure Firebird is installed on the runner or the installer script places fbclient.lib in a known location."
+            exit 1
+          }
+
+          $libDir = Split-Path $foundLib.FullName -Parent
+          Write-Host "Found fbclient lib at: $($foundLib.FullName)"
+          echo "FBCLIENT_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Prepend the found lib folder to LIB so MSVC linker finds the .lib import
+          $newLib = if ($env:LIB) { "$libDir;$env:LIB" } else { "$libDir" }
+          echo "LIB=$newLib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Added $libDir to LIB"
+
+          if ($foundDll) {
+            $dllDir = Split-Path $foundDll.FullName -Parent
+            Write-Host "Found fbclient dll at: $($foundDll.FullName)"
+            # Prepend dll dir to PATH for runtime resolution during tests
+            $newPath = if ($env:PATH) { "$dllDir;$env:PATH" } else { "$dllDir" }
+            echo "PATH=$newPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "Added $dllDir to PATH"
+
+            # Optional: copy DLL to workspace to help runtime resolution if needed
+            Copy-Item -Path $foundDll.FullName -Destination $PWD -Force
+          }
 
       - name: Create a alias to test.fdb on fb v2
         if: matrix.firebird == 'v2'
