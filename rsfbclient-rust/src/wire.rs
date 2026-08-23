@@ -7,7 +7,7 @@ use std::{borrow::Cow, convert::TryFrom, str};
 
 use crate::{
     client::{BlobId, FirebirdWireConnection},
-    consts::{gds_to_msg, AuthPluginType, Cnct, ProtocolVersion, WireOp},
+    consts::{gds_to_msg, AuthPluginType, Cnct, ProtocolVersion, WireOp, P_REQ_ASYNC},
     srp::*,
     util::*,
     xsqlda::{XSqlVar, XSQLDA_DESCRIBE_VARS},
@@ -535,6 +535,99 @@ pub fn fetch(stmt_handle: u32, blr: &[u8], count: u32) -> Bytes {
     req.put_u32(count); // Message count: request a batch of rows in a single round-trip
 
     req.freeze()
+}
+
+/// Auxiliary channel request.
+///
+/// Firebird does not push the event notifications on the connection that
+/// registered them: it asks the client to open a second, "async" connection
+/// and answers this request with the address it listens on for it.
+pub fn connect_request(db_handle: u32) -> Bytes {
+    let mut req = BytesMut::with_capacity(16);
+
+    req.put_u32(WireOp::ConnectRequest as u32);
+    req.put_u32(P_REQ_ASYNC); // Connection type
+    req.put_u32(db_handle); // Related object
+    req.put_u32(0); // Partner identification
+
+    req.freeze()
+}
+
+/// Event notification request
+pub fn que_events(db_handle: u32, epb: &[u8], event_id: u32) -> Bytes {
+    let mut req = BytesMut::with_capacity(24 + epb.len());
+
+    req.put_u32(WireOp::QueEvents as u32);
+    req.put_u32(db_handle);
+    req.put_wire_bytes(epb); // Event parameter block
+    req.put_u32(0); // Ast routine address, unused by the remote protocol
+    req.put_u32(0); // Ast routine argument, unused by the remote protocol
+    req.put_u32(event_id);
+
+    req.freeze()
+}
+
+/// Cancel an event notification request
+pub fn cancel_events(db_handle: u32, event_id: u32) -> Bytes {
+    let mut req = BytesMut::with_capacity(12);
+
+    req.put_u32(WireOp::CancelEvents as u32);
+    req.put_u32(db_handle);
+    req.put_u32(event_id);
+
+    req.freeze()
+}
+
+#[derive(Debug)]
+/// `WireOp::Event` notification, pushed by the server on the auxiliary channel
+pub struct EventNotification {
+    /// Id of the `WireOp::QueEvents` registration this notification answers
+    pub event_id: u32,
+    /// Event parameter block holding the updated occurrence counters
+    pub epb: Bytes,
+}
+
+/// Parse an event notification (`WireOp::Event`), op code included
+pub fn parse_event_notification(resp: &mut Bytes) -> Result<EventNotification, FbError> {
+    let op_code = resp.get_u32()?;
+
+    if op_code != WireOp::Event as u32 {
+        return err_conn_rejected(op_code);
+    }
+
+    resp.get_u32()?; // Database handle
+    let epb = resp.get_wire_bytes()?;
+    resp.get_u32()?; // Ast routine address, always zero
+    resp.get_u32()?; // Ast routine argument, always zero
+    let event_id = resp.get_u32()?;
+
+    Ok(EventNotification { event_id, epb })
+}
+
+/// Extract the port of the auxiliary channel from the `WireOp::ConnectRequest`
+/// response data, which holds a raw `sockaddr` of the server.
+///
+/// Only the port is used: the address the server reports is the one it sees
+/// locally, which is wrong as soon as it sits behind a NAT, so the reference
+/// client reuses the address of the main connection instead. This is what
+/// `aux_connect` does in the firebird sources. The port lives at offset 2 in
+/// network byte order for both `sockaddr_in` and `sockaddr_in6`, whatever the
+/// sockaddr layout of the server.
+pub fn parse_aux_port(data: &[u8]) -> Result<u16, FbError> {
+    if data.len() < 4 {
+        return Err(FbError::from(
+            "Invalid auxiliary channel address returned by the server",
+        ));
+    }
+
+    let port = u16::from_be_bytes([data[2], data[3]]);
+    if port == 0 {
+        return Err(FbError::from(
+            "The server did not return a port for the auxiliary event channel",
+        ));
+    }
+
+    Ok(port)
 }
 
 /// Create blob request

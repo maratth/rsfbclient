@@ -1,6 +1,9 @@
 //! Arc4 stream cipher implementation for the firebird wire encryption (Wire Protocol 13)
 
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
+};
 
 #[derive(Clone)]
 pub struct Arc4 {
@@ -62,6 +65,13 @@ impl<S> Arc4Stream<S> {
             enc_buf: vec![0; buf_len].into_boxed_slice(),
             stream,
         }
+    }
+}
+
+impl Arc4Stream<TcpStream> {
+    /// Address of the server the wrapped stream is connected to
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.stream.peer_addr()
     }
 }
 

@@ -166,6 +166,10 @@ pub enum Cnct {
     ClientCrypt = 11,
 }
 
+/// Connection type of a `WireOp::ConnectRequest`: an auxiliary port used to
+/// deliver the asynchronous event notifications
+pub const P_REQ_ASYNC: u32 = 1;
+
 #[derive(Debug, Clone, Copy)]
 pub enum AuthPluginType {
     Srp256,
